@@ -1,0 +1,55 @@
+# 场景：选址 / 场地（SPEC §9）—— GEO 空间检索与证据核验
+name: geo_site
+description: 基于地理空间检索的选址/场地推荐（半径筛选、距离与证据核验）
+knowledge:
+  - knowledge/geo_site/*.md
+
+intent_keywords:
+  选址: [选址, 场地, 找地方, 办公点]
+  附近: [附近, 周边, 半径, 多远, 距离]
+  场地: [场地, 会议室, 门店, 工位]
+
+slots:
+  - {name: location,  required_for: [选址, 附近], prompt: 以哪个地点为中心（地名或坐标）？}
+  - {name: radius_km, required_for: [], prompt: 搜索半径多少公里？}
+    # 默认值由 local driver / 主控在缺槽时填 2（见 slot_defaults）
+  - {name: category,  required_for: [], prompt: 目标场地类别（咖啡馆/共享办公/图书馆）？}
+
+slot_defaults:
+  radius_km: 2
+
+policies:
+  preauth: []   # GEO 工具均为 low 风险只读工具，无需授权
+
+subtask_templates:
+  选址:
+    - id: site_research
+      role: researcher
+      objective: 在目标半径内检索候选场地并返回距离/属性/证据
+      tool: geo_radius_search
+      risk: low
+      tool_args:
+        center: "{slots.location}"
+        radius_km: "{slots.radius_km}"
+        filters:
+          category: "{slots.category}"
+        sort_by: distance
+    - id: site_verify
+      role: verifier
+      objective: 核验距离（haversine 真实计算）、证据链与坐标系（EPSG:4326）；source 非真实来源的属性（source:null）不得作为事实断言
+      depends: [0]
+
+  附近:
+    - id: nearby_research
+      role: researcher
+      objective: 检索中心点周边半径内候选点
+      tool: geo_radius_search
+      risk: low
+      tool_args:
+        center: "{slots.location}"
+        radius_km: "{slots.radius_km}"
+        sort_by: distance
+    - id: nearby_verify
+      role: verifier
+      objective: 核验距离计算与证据；route/通勤类问题无 provider 时如实说明不支持，不得编造通勤时间
+      depends: [0]

@@ -1,0 +1,29 @@
+# SPEC §10 用例 7：审批等待不阻塞并行分支；批准后分支恢复
+# （SPEC §6"一个 waiting_approval 不阻塞其他分支"；§3 批准绑定 args）
+# 采购模板含 4 个分支：researcher → verifier → executor_purchase(high)，
+# 以及 notify_admin(medium, 仅依赖 researcher，走场景 preauth) —— 用于验证并行。
+id: approval_parallel_resume
+name: 采购待审批时通知分支并行完成，批准后采购恢复
+scenario: team_ops
+goal: "我要采购2台显示器，预算6000元，走 approved-vendor，同时通知行政"
+slots:
+  item: 显示器
+  budget: "6000"
+  vendor: approved-vendor
+  quantity: 2
+  channel: ops
+  to: admin
+flow:
+  - do: tick
+    name: waiting_phase     # purchase_exec 进入 waiting_approval；notify_admin 应已并行完成
+  - do: wait_approval
+    name: at_wait
+  - do: approve
+    decision: approved      # Engine.decide_approval 以 args_hash 校验绑定参数后 tick 恢复
+    name: decided
+  - do: tick
+    name: resumed
+expect:
+  terminal_not_pending: true
+  parallel_approval_notify: true   # approval_requested 与 notify tool_result 事件顺序证明并行、notify 未阻塞
+  purchase_resumed: true           # approval_decided(approved) 后 make_purchase 成功且分支 completed

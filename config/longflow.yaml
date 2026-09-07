@@ -1,0 +1,37 @@
+# LongFlow 主配置（SPEC §0/§5/§8）
+# 密钥绝不写入本文件：OpenAI 兼容驱动的 Key 只从环境变量 LLM_API_KEY 读取。
+
+llm:
+  # driver: local = 默认的确定性规则驱动（离线闭环可跑，无需任何凭证）
+  driver: local
+  # 切换为真实模型时改为：
+  #   driver: openai_compatible
+  #   base_url: "https://api.openai.com/v1"   # 或任意 OpenAI 兼容网关地址
+  #   model: "gpt-4o-mini"
+  # 并在环境中设置：export LLM_API_KEY=sk-...   （Windows: setx LLM_API_KEY "sk-..."）
+  base_url: null
+  model: null
+
+plugins:
+  geo:
+    enabled: true
+    config:
+      provider: local   # local=仅本地 GeoJSON；route 模式无 provider 时返回 supported:false
+  example_weather:
+    enabled: true
+    config: {}
+
+# 编排预算与恢复循环（SPEC §6）
+limits:
+  max_steps: 30
+  max_llm_calls: 80
+  tick_interval_seconds: 2
+  max_verify_rounds: 2
+
+server:
+  host: "127.0.0.1"
+  port: 8765
+
+scenarios:
+  - config/scenarios/team_ops.yaml
+  - config/scenarios/geo_site.yaml

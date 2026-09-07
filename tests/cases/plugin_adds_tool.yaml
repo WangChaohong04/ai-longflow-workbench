@@ -1,0 +1,12 @@
+# SPEC §10 用例 9：插件加载后工具注册表扩展（SPEC §8 example_weather）
+id: plugin_adds_tool
+name: weather 插件注册工具且禁用后消失
+scenario: team_ops
+goal: "北京今天天气怎么样？"
+flow:
+  - do: tick
+    name: driven
+expect:
+  weather_tool_present: true              # 注册表含 weather_get
+  weather_mock: true                       # 调用返回含 mock/模拟 标注
+  weather_tool_absent_when_disabled: true  # 禁用 example_weather 后工具消失

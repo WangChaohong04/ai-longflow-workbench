@@ -1,0 +1,98 @@
+# 场景：团队行政（SPEC §9）—— 知识问答与多步骤任务
+name: team_ops
+description: 团队行政知识问答与多步骤任务（采购/报销/规则查询/通知）
+knowledge:
+  - knowledge/team_ops/*.md
+
+intent_keywords:
+  采购: [采购, 购买, 下单, 添置, 申购]
+  报销: [报销, 费用报销, 贴票, 报账]
+  规则: [规则, 政策, 制度, 假期, 差旅, 标准]
+  通知: [通知, 告知, 同步, 发消息]
+
+slots:
+  - {name: item,     required_for: [采购], prompt: 采购物品是什么？}
+  - {name: budget,   required_for: [采购], prompt: 预算上限是多少（元）？}
+  - {name: quantity, required_for: [],     prompt: 采购数量是多少？}
+
+policies:
+  # send_notification(channel='ops', ...) 走预授权：对象 glob 匹配 channel:ops:*，
+  # 最多 5 次、12 小时有效；其余 channel 或次数用尽仍需逐次审批。
+  preauth:
+    - tool: send_notification
+      object_pattern: 'channel:ops:*'
+      max_count: 5
+      expires_hours: 12
+
+subtask_templates:
+  采购:
+    - id: purchase_research
+      role: researcher
+      objective: 检索采购规则与预算审批要求（供应商名录、金额审批线）
+      tool: kb_search
+      tool_args: {query: "采购规则 审批 供应商名录 预算"}
+    - id: purchase_verify
+      role: verifier
+      objective: 核验规则引用与预算约束（审批线、供应商是否在名录、金额阈值）
+      depends: [0]
+    - id: purchase_exec
+      role: executor
+      objective: 在预算与规则内提交采购申请（make_purchase；high 风险须逐次审批）
+      tool: make_purchase
+      risk: high
+      side_effect: true
+      depends: [1]
+      tool_args:
+        vendor: "{slots.vendor}"
+        item: "{slots.item}"
+        amount: "{slots.budget}"
+        currency: CNY
+    # 并行分支：只依赖研究员（规则确认即可通知行政），不依赖采购审批 ——
+    # 用于验证"分支 A 等待审批时，分支 B 继续执行"（SPEC §6/§10 用例 7）。
+    - id: notify_admin
+      role: executor
+      objective: 向 ops 渠道通知行政同事：采购申请已发起（走 preauth）
+      tool: send_notification
+      risk: medium
+      side_effect: true
+      depends: [0]
+      tool_args:
+        channel: ops
+        to: admin
+        text: "采购申请已发起：{slots.item}（预算 {slots.budget} 元），请知悉。"
+
+  报销:
+    - id: expense_research
+      role: researcher
+      objective: 检索报销规则（额度、票据要求、差旅住宿标准注意版本冲突）
+      tool: kb_search
+      tool_args: {query: "报销规则 差旅 住宿 标准 票据"}
+    - id: expense_verify
+      role: verifier
+      objective: 核验引用支持关系；差旅住宿标准存在 2023/2024 版本冲突时须标注冲突
+      depends: [0]
+
+  规则:
+    - id: rule_research
+      role: researcher
+      objective: 检索相关规则条款并附引用
+      tool: kb_search
+      tool_args: {query: "{goal}"}
+    - id: rule_verify
+      role: verifier
+      objective: 核验引用支持关系，无引用支撑的事实性论断不得通过出口闸门
+      depends: [0]
+
+  通知:
+    - id: notify_research
+      role: researcher
+      objective: 确认通知对象与渠道规则
+      tool: kb_search
+      tool_args: {query: "通知 渠道 行政"}
+    - id: notify_send
+      role: executor
+      objective: 发送通知（ops 渠道走 preauth；其他渠道需审批）
+      tool: send_notification
+      risk: medium
+      side_effect: true
+      depends: [0]

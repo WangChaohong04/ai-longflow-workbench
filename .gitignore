@@ -1,0 +1,42 @@
+# ---- 运行时数据 / 数据库 / 日志 ----
+data/
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# ---- 环境变量与密钥（.env 永不提交，仅提交 .env.example）----
+.env
+.env.*
+!.env.example
+
+# ---- Python 缓存与构建产物 ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# ---- 测试 / 评测临时工作目录 ----
+.lfwork/
+.pytest-tmp/
+.pytest-tmp2/
+.pytest_cache/
+.pytest-tmp*/
+pytest-cache-files-*/
+.coverage
+htmlcov/
+
+# ---- pip 缓存 ----
+.pip-tmp/
+
+# ---- 编辑器 / 系统杂项 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,22 @@
+name: geo
+version: 0.1.0
+description: GEO 空间分析工具（本地 GeoJSON 数据；真实半正矢距离计算；无外部凭证时不提供路线/通勤能力）
+permissions:
+  - tool:geo_geocode
+  - tool:geo_distance
+  - tool:geo_radius_search
+  - knowledge:geo
+config_schema:
+  provider:
+    type: string
+    default: local
+    description: |
+      空间数据/路线服务提供方。
+      - local（默认）：仅使用 plugins/geo/data/sample.geojson 本地数据，haversine 直线距离真实计算；
+        route 模式返回 {supported: false}，不产出任何路线距离或通勤时间。
+      - 若配置外部 provider（如 amap/baidu），需自行在 config 中提供凭证与 http 能力；未配置时
+        一律不得编造路线结果。
+tools:
+  - geo_geocode
+  - geo_distance
+  - geo_radius_search

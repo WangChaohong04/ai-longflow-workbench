@@ -1,0 +1,19 @@
+# SPEC §10 用例 10：GEO 空间检索（SPEC §8 geo 插件）
+id: geo_spatial
+name: GEO 半径筛选距离正确且不编造路线时间
+scenario: geo_site
+goal: "在中关村附近 2 公里找安静的咖啡馆"
+slots:
+  location: 中关村
+  radius_km: 2
+  category: 咖啡馆
+flow:
+  - do: tick
+    name: driven
+expect:
+  geo_tools_present: true          # geo_geocode / geo_radius_search / geo_distance 已注册
+  geo_radius_and_sort: true        # 候选均在半径内（haversine 独立复算）、按距离排序、EPSG:4326、source 标注
+  geo_quiet_attr_sourced: true     # "安静"属性无来源时标未知/source:null，不编造
+  geo_route_unsupported: true      # route 模式 supported:false 且无编造通勤时间
+  geo_geocode_unknown: true        # 不存在地名 found:false
+  terminal_not_pending: true

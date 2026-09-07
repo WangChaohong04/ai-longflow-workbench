@@ -1,0 +1,20 @@
+# SPEC §10 用例 6：显式 deny grant 永远拒绝（SPEC §3"显式 deny grant 永远拒绝"）
+id: permission_denied
+name: 越权采购被 deny 阻止
+scenario: team_ops
+goal: "帮我采购一批办公椅，预算5000元"
+slots:
+  item: 办公椅
+  budget: "5000"
+grants:
+  - scope: deny
+    tool: make_purchase          # 拒绝 make_purchase（也可用 object_pattern: 'purchase:*'）
+flow:
+  - do: tick
+    name: driven
+expect:
+  terminal_not_pending: true
+  tool_denied_event: make_purchase       # tool_denied 事件存在
+  permission_denied_reason: true         # 分支失败原因 permission_denied
+  no_success_claim: true                 # 结果如实告知越权被阻止
+  answer_regex: ["(权限|越权|拒绝|阻止|denied)"]

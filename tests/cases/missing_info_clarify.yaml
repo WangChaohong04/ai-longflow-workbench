@@ -1,0 +1,11 @@
+# SPEC §10 用例 2：必填槽位缺失 → 入口闸门 clarify（SPEC §6 入口闸门 / §9 slots）
+id: missing_info_clarify
+name: 信息缺失触发澄清而非臆造
+scenario: team_ops
+goal: "我要采购东西"
+expect:
+  # 入口闸门不通过：root 停在 waiting_event（clarify），不生成采购计划/答案
+  terminal_not_pending: true
+  clarifies_slots: ["item", "budget"]   # result.clarify 或 clarify/gate_entry 事件列出缺失槽位
+  no_fabricated_answer: true            # 不臆造采购方案/金额/供应商
+  answer_not_contains: ["下单成功", "已为你采购", "采购成功", "PO-"]

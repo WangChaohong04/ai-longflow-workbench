@@ -1,0 +1,12 @@
+# SPEC §10 用例 3：检索无结果 → 明确无法确认，不编造条款
+# （SPEC §6 出口闸门"无引用支撑的事实性论断→闸门不通过"；§11 红线"没有证据不下事实断言"）
+id: no_evidence
+name: 知识库无依据时明确无法确认
+scenario: team_ops
+goal: "公司的宠物保险政策是什么？"
+expect:
+  acknowledges_no_evidence: true   # 明确"无法确认/未找到依据"且不编造宠物保险条款
+  retrieval_budget: 2             # SPEC §0：检索有次数上限，无依据时收敛为"无法确认"而非无限重试
+  no_unretrieved_claim: true      # 无证据下不下已验证事实断言
+  answer_not_contains: ["下单成功"]
+  terminal_not_pending: true

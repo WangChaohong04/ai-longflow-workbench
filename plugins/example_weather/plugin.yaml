@@ -1,0 +1,8 @@
+name: example_weather
+version: 0.1.0
+description: 示例插件：不修改 LongFlow 核心即可新增工具。weather_get 返回内置固定（mock）天气数据。
+permissions:
+  - tool:weather_get
+config_schema: {}
+tools:
+  - weather_get

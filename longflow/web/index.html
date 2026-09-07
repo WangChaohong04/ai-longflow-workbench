@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="color-scheme" content="light dark">
+<title>LongFlow 长程任务工作台</title>
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%234f6ef7'/%3E%3Cpath d='M9 22V10h3v9h6v3H9zm11 0v-8h3v8h-3z' fill='white'/%3E%3C/svg%3E">
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-inner">
+    <button class="brand" id="brand" type="button" title="返回任务列表">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <span class="brand-text">
+        <strong>LongFlow</strong>
+        <small>长程任务工作台</small>
+      </span>
+    </button>
+    <nav class="tabs" id="tabs" aria-label="主导航">
+      <button type="button" class="tab" data-view="tasks">任务</button>
+      <button type="button" class="tab" data-view="new">新建任务</button>
+      <button type="button" class="tab" data-view="plugins">插件</button>
+      <button type="button" class="tab" data-view="eval">评测</button>
+    </nav>
+    <div class="health" id="health" title="后端连接状态"><span class="health-dot"></span><span id="health-text">连接中…</span></div>
+  </div>
+</header>
+
+<div class="toast-wrap" id="toast-wrap" aria-live="polite"></div>
+
+<main class="container" id="app">
+  <p class="loading">加载中…</p>
+</main>
+
+<footer class="footer">
+  <span>LongFlow · 零构建前端 · 离线可用</span>
+  <span id="footer-hint"></span>
+</footer>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

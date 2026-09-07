@@ -1,0 +1,15 @@
+# SPEC §10 用例 1：正常知识回答 + 引用核验（SPEC §4 出口闸门）
+id: e2e_citation
+name: 知识回答附引用且引用支撑论断
+scenario: team_ops
+goal: "公司采购笔记本电脑的审批规则是什么？"
+expect:
+  status: completed
+  verified: true
+  answer_contains: ["第三条", "审批"]
+  answer_regex: ["\\d+\\s*元"]              # 审批金额要点（第三条：5000 元审批线）
+  citations_present: true
+  no_unsupported_claims: true   # → citations_support：每条 citation 的 chunk 文本词重叠核验
+  retrieval_on_demand: 2        # SPEC §0：仅研究员按需检索（≤2 次），verifier/controller 复用证据
+  no_unretrieved_claim: true    # verified=true 必有引用，未检索的推断不充当事实
+  terminal_not_pending: true

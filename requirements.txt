@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+pyyaml
+httpx
+pytest  # 仅回归评测需要（python -m pytest tests/ -q）；仅运行 serve 可不装

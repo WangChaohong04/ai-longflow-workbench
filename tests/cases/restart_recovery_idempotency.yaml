@@ -1,0 +1,31 @@
+# SPEC §10 用例 8：重启恢复 + 副作用幂等
+# （SPEC §1"idempotency_key=sha256(tool|canonical_args|root_id)，恢复时 key 已成功→不重复执行"；
+#   §6 run_root 可重入可恢复）
+# 供应商用标准名录内 approved-vendor（make_purchase 对名录外供应商如实失败）。
+id: restart_recovery_idempotency
+name: 审批后重启恢复且副作用只执行一次
+scenario: team_ops
+goal: "我要采购1台打印机，预算2000元，走标准供应商 approved-vendor"
+slots:
+  item: 打印机
+  budget: "2000"
+  vendor: approved-vendor
+  quantity: 1
+flow:
+  - do: tick
+    name: waiting            # make_purchase(high) → waiting_approval
+  - do: wait_approval
+    name: at_wait
+  - do: approve
+    decision: approved
+    name: approved
+  # 模拟进程重启：新连接打开同一 DB（内存状态全丢），重新 tick
+  - do: restart
+    name: after_restart_1
+  # 再次重启/重入：幂等键命中，不得产生第二次 make_purchase 真实副作用
+  - do: restart
+    name: after_restart_2
+expect:
+  terminal_not_pending: true
+  purchase_side_effect_once: 1   # make_purchase 真实（非回放）tool_result 恰为 1 次，root completed
+  recovery_no_reretrieve: true   # SPEC §0：重启/恢复阶段不重复已完成检索，复用持久化证据
