@@ -1,6 +1,6 @@
 /* LongFlow 长程任务工作台 —— 零构建、零依赖原生 ES Module
  * 仅通过 fetch 调用 /api/*；所有渲染均做防御式取值。 */
-import { getActiveMapPlugin, listMapPlugins, setManualMapPlugin, getManualMapPlugin } from "./maps/index.js";
+import { getActiveMapPlugin, getActiveMapPluginId, listMapPlugins, setActiveMapPlugin, getManualMapPlugin, MAP_ROUTE_MODES } from "./maps/index.js";
 
 // ============================== 全局状态 ==============================
 const state = {
@@ -934,9 +934,12 @@ function buildGeoCard({ geo, title, key }, geoKey) {
   return card;
 }
 
-// ---- 地点列表（同时提供"路线规划 / 高德打开"入口，地图不可用时仍可用）----
+// ---- 地点列表（外部打开/路线入口经当前地图插件；地图不可用时外部打开仍可用）----
 function buildSiteList(pane, geo) {
+  const plugin = activeMapPlugin();
+  const caps = (plugin && plugin.capabilities) || {};
   const cands = asArray(geo.candidates).filter((c) => Number.isFinite(+c.lat));
+  const openLabel = plugin ? plugin.getExternalOpenLabel() : "在地图中打开";
   for (const c of cands) {
     const props = c.properties || c.props || {};
     const addr = c.address || props.address || "";
@@ -949,54 +952,62 @@ function buildSiteList(pane, geo) {
           cat ? el("span", {}, ` · ${cat}`) : null,
           addr ? el("span", { class: "muted" }, ` · ${addr}`) : null)));
     const btns = el("div", { class: "site-btns" });
-    btns.appendChild(el("button", { class: "btn sm", onClick: () => openGeoRoute(geo, c) }, "路线规划"));
-    btns.appendChild(el("button", { class: "btn sm ghost", onClick: () => openExternalSite(c) }, "高德地图打开"));
+    if (caps.route && geo.center) {
+      btns.appendChild(el("button", { class: "btn sm", onClick: () => openExternalRoute(geo, c) }, "路线规划"));
+    }
+    if (caps.externalSite) {
+      btns.appendChild(el("button", { class: "btn sm ghost", onClick: () => openExternalSite(c) }, openLabel));
+    }
     row.appendChild(btns);
     pane.appendChild(row);
   }
   if (!cands.length) pane.appendChild(el("div", { class: "muted" }, "无候选地点。"));
 }
 
+// 当前启用地图插件（无可用返回 null）
+function activeMapPlugin() {
+  const mapCfg = (state.config && state.config.map_plugins) || {};
+  return getActiveMapPlugin(mapCfg);
+}
+
 function openExternalSite(c) {
-  amapSiteUrl(c).then((url) => {
-    if (url) window.open(url, "_blank", "noopener");
-    else toast("该地点缺少经纬度，无法打开高德地图。", "warn");
-  }).catch(() => {
-    const lon = c.lng != null ? c.lon : c.lon;
-    if (Number.isFinite(+c.lat)) window.open(`https://uri.amap.com/marker?position=${+lon},${+c.lat}&name=${encodeURIComponent(c.name || "地点")}&callnative=1`, "_blank", "noopener");
-    else toast("该地点缺少经纬度，无法打开高德地图。", "warn");
+  const plugin = activeMapPlugin();
+  if (!plugin || !plugin.capabilities.externalSite || !Number.isFinite(+c.lat)) {
+    toast("该地点缺少经纬度或未启用地图插件，无法打开外部地图。", "warn");
+    return;
+  }
+  try {
+    window.open(plugin.openExternalSite(c), "_blank", "noopener");
+  } catch (e) {
+    toast("打开外部地图失败。", "warn");
+  }
+}
+
+function openExternalRoute(geo, candidate) {
+  const plugin = activeMapPlugin();
+  if (!plugin || !plugin.capabilities.externalRoute || !geo.center) {
+    toast("当前地图插件不支持外部路线打开。", "warn");
+    return;
+  }
+  const url = plugin.openExternalRoute({
+    origin: { name: (geo.center && geo.center.name) || "起点", lat: +geo.center.lat, lon: +geo.center.lon },
+    destination: { name: candidate.name || "终点", lat: +candidate.lat, lon: +(candidate.lon != null ? candidate.lon : candidate.lng) },
+    mode: "driving",
   });
+  window.open(url, "_blank", "noopener");
 }
 
-// 延迟导入高德模块（无构建环境下动态加载；语法检查仍覆盖）
-let _amapHelpers = null;
-async function amapHelpers() {
-  if (_amapHelpers) return _amapHelpers;
-  _amapHelpers = await import("./maps/amap.js");
-  return _amapHelpers;
-}
-async function amapSiteUrl(c) {
-  const m = await amapHelpers();
-  return m.amapSiteUrl(c);
-}
-async function openGeoRoute(geo, candidate) {
-  const m = await amapHelpers();
-  const f = { name: (geo.center && geo.center.name) || "中心", lat: +geo.center.lat, lon: +geo.center.lon };
-  const t = { name: candidate.name || "终点", lat: +candidate.lat, lon: +(candidate.lon != null ? candidate.lon : candidate.lng) };
-  window.open(m.amapRouteUrl(f, t, "driving"), "_blank", "noopener");
-  toast("正在跳转高德地图路线规划…", "info");
-}
-
-// ---- 地图面板控制器：维护插件实例与 DOM 宿主，跨静默刷新复用（不重建地图/不打断）----
+// ---- 地图面板控制器：维护插件实例与 DOM 宿主，跨静默刷新复用（不重建/不打断）----
 function buildMapPane(pane, geo, geoKey) {
   const mapCfg = (state.config && state.config.map_plugins) || {};
   const plugin = getActiveMapPlugin(mapCfg);
 
   // 无可用地图插件：提示并回退内联 SVG（不崩溃，Marker/直线距离仍可见）
   if (!plugin) {
-    const why = mapCfg.amap && !mapCfg.amap.js_key_configured
-      ? "未配置高德 Key（AMAP_JS_KEY），显示离线示意图。配置后即可使用真实地图与路线。"
-      : "当前未启用地图插件，显示离线示意图。";
+    const name = (getActiveMapPluginId(mapCfg) || "");
+    const why = mapCfg.amap && mapCfg.amap.enabled !== false && !mapCfg.amap.js_key_configured
+      ? "未配置地图 JS Key，显示离线示意图。配置后即可使用真实地图与路线（详见 .env.example）。"
+      : "当前未启用可用的地图插件，显示离线示意图。";
     pane.appendChild(el("div", { class: "map-notice" },
       el("div", { class: "map-notice-t" }, "地图插件不可用"),
       el("div", { class: "muted", style: "margin:4px 0 8px" }, why)));
@@ -1005,26 +1016,40 @@ function buildMapPane(pane, geo, geoKey) {
     return;
   }
 
+  const displayName = plugin.getDisplayName();
   const bottom = el("div", { class: "map-bottom" });
 
   let panel = state.mapPanels.get(geoKey);
+  // 切换了插件：销毁旧实例，避免两个地图/监听残留
+  if (panel && panel.pluginId && panel.pluginId !== plugin.id) {
+    try { panel.plugin && panel.plugin.destroy(); } catch (e) { /* ignore */ }
+    if (panel.hostEl && panel.hostEl.parentNode) panel.hostEl.parentNode.removeChild(panel.hostEl);
+    state.mapPanels.delete(geoKey);
+    panel = null;
+  }
+
   let host;
   if (panel && panel.hostEl) {
-    // 静默刷新重建 DOM：把原地图容器（地图实例仍存活）移进新卡片，避免重新加载/空白
+    // 静默刷新重建 DOM：把原地图容器（地图实例仍存活）移进新卡片
     host = panel.hostEl;
     pane.appendChild(host);
     pane.appendChild(bottom);
     panel.bottom = bottom;
-    try { panel.plugin._map && panel.plugin._map.resize && panel.plugin._map.resize(); } catch (e) { /* ignore */ }
+    panel.plugin = plugin;
+    safeMapResize(plugin);
     renderMapBottom(panel, geo);
     return;
   }
 
-  host = el("div", { class: "amap-host", style: "height:440px;border-radius:10px;overflow:hidden;background:var(--bg-2)" });
+  host = el("div", { class: "map-host", style: "height:440px;border-radius:10px;overflow:hidden;background:var(--bg-2)" });
   pane.appendChild(host);
   pane.appendChild(bottom);
 
-  panel = { plugin, hostEl: host, mode: "normal", selected: null, routeTarget: null, routeResult: null, routeMode: "driving" };
+  panel = {
+    plugin, pluginId: plugin.id, hostEl: host,
+    mode: "normal", selected: null, routeTarget: null,
+    routeResult: null, routeMode: (plugin.capabilities.routeModes || ["driving"])[0],
+  };
   state.mapPanels.set(geoKey, panel);
   panel.bottom = bottom;
 
@@ -1034,10 +1059,10 @@ function buildMapPane(pane, geo, geoKey) {
   plugin.mount(host).then(() => {
     plugin.showSites(geo, (cc) => { panel.selected = cc; renderMapBottom(panel, geo); });
   }).catch((err) => {
-    host.remove();
-    bottom.remove();
+    if (host.parentNode) host.parentNode.removeChild(host);
+    if (bottom.parentNode) bottom.parentNode.removeChild(bottom);
     pane.appendChild(el("div", { class: "map-notice" },
-      el("div", { class: "map-notice-t" }, "地图加载失败"),
+      el("div", { class: "map-notice-t" }, `${displayName}加载失败`),
       el("div", { class: "muted", style: "margin:4px 0 8px" }, String((err && err.message) || err)),
       el("div", { class: "muted", style: "margin-bottom:8px" }, "仍可使用下方地点列表与直线距离。")));
     const { svg } = buildGeoSvg(geo);
@@ -1045,16 +1070,31 @@ function buildMapPane(pane, geo, geoKey) {
   });
 }
 
+function safeMapResize(plugin) {
+  try {
+    // 插件内部地图对象不透明；尝试触发其公开 resize（若有）
+    if (typeof plugin.resize === "function") plugin.resize();
+  } catch (e) { /* ignore */ }
+}
+
+function modeOptions(plugin) {
+  const ids = ((plugin && plugin.capabilities && plugin.capabilities.routeModes) || []);
+  return MAP_ROUTE_MODES.filter((m) => ids.includes(m.id));
+}
+
 function renderMapBottom(panel, geo) {
   const bottom = panel.bottom;
   if (!bottom) return;
   bottom.innerHTML = "";
+  const plugin = panel.plugin;
+  const caps = plugin.capabilities || {};
 
   if (panel.mode === "route" && panel.routeTarget) { renderRouteBottom(panel, geo, bottom); return; }
 
   const c = panel.selected;
   if (!c) {
-    bottom.appendChild(el("div", { class: "map-hint muted" }, "点击地图上的地点标记查看详情；Haversine 直线距离用于筛选，道路路线由高德计算。"));
+    bottom.appendChild(el("div", { class: "map-hint muted" },
+      `点击地图上的地点标记查看详情；Haversine 直线距离用于筛选，道路路线由${plugin.getDisplayName()}计算。`));
     return;
   }
   const props = c.properties || c.props || {};
@@ -1066,9 +1106,9 @@ function renderMapBottom(panel, geo) {
       c.distance_km != null ? el("div", {}, `直线距离：${(+c.distance_km).toFixed(2)} km`) : null,
       cat ? el("div", {}, `类别：${cat}`) : null,
       addr ? el("div", { class: "muted" }, `地址：${addr}`) : null));
-  const actions = el("div", { class: "msc-actions" },
-    el("button", { class: "btn primary sm", onClick: () => startRoute(panel, geo, c) }, "路线规划"),
-    el("button", { class: "btn sm ghost", onClick: () => openExternalSite(c) }, "高德地图打开"));
+  const actions = el("div", { class: "msc-actions" });
+  if (caps.route && geo.center) actions.appendChild(el("button", { class: "btn primary sm", onClick: () => startRoute(panel, geo, c) }, "路线规划"));
+  if (caps.externalSite) actions.appendChild(el("button", { class: "btn sm ghost", onClick: () => openExternalSite(c) }, plugin.getExternalOpenLabel()));
   card.appendChild(actions);
   bottom.appendChild(card);
 }
@@ -1076,7 +1116,8 @@ function renderMapBottom(panel, geo) {
 function startRoute(panel, geo, c) {
   panel.mode = "route";
   panel.routeTarget = c;
-  panel.routeMode = panel.routeMode || "driving";
+  const modes = modeOptions(panel.plugin);
+  if (!modes.includes(panel.routeMode)) panel.routeMode = modes[0] || "driving";
   panel.routeResult = { loading: true };
   renderMapBottom(panel, geo);
   runRoute(panel, geo);
@@ -1091,27 +1132,33 @@ function exitRoute(panel, geo) {
   renderMapBottom(panel, geo);
 }
 
-function runRoute(panel, geo) {
+async function runRoute(panel, geo) {
   const c = panel.routeTarget;
-  const f = { name: (geo.center && geo.center.name) || "起点", lat: +geo.center.lat, lon: +geo.center.lon };
-  const t = { name: c.name || "终点", lat: +c.lat, lon: +(c.lon != null ? c.lon : c.lng) };
-  panel.plugin.planRoute(f, t, panel.routeMode, (res) => {
-    panel.routeResult = res;
-    renderMapBottom(panel, geo);
-  });
+  const origin = { name: (geo.center && geo.center.name) || "起点", lat: +geo.center.lat, lon: +geo.center.lon };
+  const destination = { name: c.name || "终点", lat: +c.lat, lon: +(c.lon != null ? c.lon : c.lng) };
+  try {
+    const res = await panel.plugin.planRoute({ origin, destination, mode: panel.routeMode });
+    panel.routeResult = res || { ok: false, error: "暂时无法获取路线。" };
+  } catch (e) {
+    panel.routeResult = { ok: false, error: "暂时无法获取路线。" };
+  }
+  renderMapBottom(panel, geo);
 }
 
 function renderRouteBottom(panel, geo, bottom) {
+  const plugin = panel.plugin;
+  const caps = plugin.capabilities || {};
   const c = panel.routeTarget;
-  const modeLabel = ((panel.plugin.modes || []).find((m) => m.id === panel.routeMode) || {}).label || "";
+  const modeLabel = (modeOptions(plugin).find((m) => m.id === panel.routeMode) || {}).label || "";
 
   bottom.appendChild(el("div", { class: "route-title" },
     el("strong", {}, (geo.center && geo.center.name) || "起点"),
     el("span", { class: "muted" }, " → "),
     el("strong", {}, c.name || "终点")));
 
+  // 方式切换：仅显示插件声明支持的模式
   const seg = el("div", { class: "route-modes" });
-  for (const m of (panel.plugin.modes || [])) {
+  for (const m of modeOptions(plugin)) {
     seg.appendChild(el("button", {
       type: "button",
       class: `route-mode${panel.routeMode === m.id ? " active" : ""}`,
@@ -1123,36 +1170,40 @@ function renderRouteBottom(panel, geo, bottom) {
   const info = el("div", { class: "route-info" });
   const res = panel.routeResult;
   if (!res || res.loading) {
-    info.appendChild(el("div", { class: "muted" }, "正在请求高德路线…"));
+    info.appendChild(el("div", { class: "muted" }, "正在请求路线…"));
   } else if (!res.ok) {
-    info.appendChild(el("div", { class: "route-err" }, res.error || "暂时无法获取高德路线。"));
+    info.appendChild(el("div", { class: "route-err" }, res.error || "暂时无法获取路线。"));
     info.appendChild(el("div", { class: "muted", style: "margin-top:4px" },
       `直线距离参考：${c.distance_km != null ? (+c.distance_km).toFixed(2) : "—"} km`));
   } else {
     info.appendChild(el("div", { class: "route-stat" },
       el("strong", {}, modeLabel),
-      el("span", {}, ` ${res.distanceText}`),
-      el("span", { class: "muted" }, ` · 约 ${res.durationText}`)));
-    if (res.segments && res.segments.length) {
+      el("span", {}, ` ${res.summary || ""}`)));
+    if (res.steps && res.steps.length) {
       const det = el("details", { class: "route-detail" }, el("summary", {}, "查看详细换乘"));
       const ol = el("ol", { class: "route-steps" });
-      res.segments.slice(0, 8).forEach((s) => ol.appendChild(el("li", {}, s)));
+      res.steps.slice(0, 8).forEach((s) => ol.appendChild(el("li", {}, s)));
       det.appendChild(ol);
       info.appendChild(det);
     }
   }
   bottom.appendChild(info);
 
-  const actions = el("div", { class: "msc-actions" },
-    el("button", {
+  const actions = el("div", { class: "msc-actions" });
+  if (caps.externalRoute && geo.center) {
+    actions.appendChild(el("button", {
       class: "btn primary sm",
       onClick: () => {
-        const f = { name: (geo.center && geo.center.name) || "起点", lat: +geo.center.lat, lon: +geo.center.lon };
-        const t = { name: c.name || "终点", lat: +c.lat, lon: +(c.lon != null ? c.lon : c.lng) };
-        amapHelpers().then((m) => window.open(m.amapRouteUrl(f, t, panel.routeMode), "_blank", "noopener"));
+        const url = plugin.openExternalRoute({
+          origin: { name: (geo.center && geo.center.name) || "起点", lat: +geo.center.lat, lon: +geo.center.lon },
+          destination: { name: c.name || "终点", lat: +c.lat, lon: +(c.lon != null ? c.lon : c.lng) },
+          mode: panel.routeMode,
+        });
+        if (url) window.open(url, "_blank", "noopener");
       },
-    }, "在高德地图打开"),
-    el("button", { class: "btn sm ghost", onClick: () => exitRoute(panel, geo) }, "退出路线"));
+    }, plugin.getExternalOpenLabel()));
+  }
+  actions.appendChild(el("button", { class: "btn sm ghost", onClick: () => exitRoute(panel, geo) }, "退出路线"));
   bottom.appendChild(actions);
 }
 
@@ -1439,47 +1490,66 @@ async function renderPlugins(app) {
 }
 
 
-// ---- 插件页：地图插件分区（AMap 默认；Google Maps Coming Soon）----
+// ---- 插件页：地图插件分区（由注册表通用渲染，不写死任何 Provider）----
 function buildMapPluginsSection() {
   const mapCfg = (state.config && state.config.map_plugins) || {};
   const section = el("section", { class: "map-plugin-section" });
   section.appendChild(el("h2", { style: "margin-bottom:4px" }, "地图插件",
-    el("span", { class: "hint" }, "负责真实地图展示、道路路线与导航跳转；Agent 的地理分析本身不依赖地图")));
+    el("span", { class: "hint" }, "负责真实地图展示、道路路线与导航跳转；当前启用哪个就用哪个，Agent 地理分析不依赖地图")));
 
   const wrap = el("div", { class: "plugin-grid" });
+  const activeId = getActiveMapPluginId(mapCfg);
+  const manual = getManualMapPlugin();
   const items = listMapPlugins(mapCfg);
-  const activeId = getManualMapPlugin() || mapCfg.active || "amap";
 
   for (const m of items) {
-    const isActive = m.id === activeId && !m.coming_soon;
+    const isActive = m.available && m.id === activeId && !manual ? true
+      : (m.available && m.id === activeId);
     const card = el("div", { class: `plugin-card${isActive ? "" : " disabled"}` },
       el("div", { class: "pc-head" },
-        el("span", { class: "pc-name" }, m.label),
+        el("span", { class: "pc-name" }, m.name),
+        m.version ? el("span", { class: "mono muted" }, "v" + m.version) : null,
         el("span", { class: "spacer", style: "flex:1" }),
         m.coming_soon ? badge("Coming Soon", "")
-          : isActive ? badge("已开启", "ok")
-          : badge("未开启", "")));
-    card.appendChild(el("div", { class: "pc-desc" }, m.desc));
-    if (m.id === "amap") {
+          : isActive ? badge("当前使用", "ok")
+          : m.available ? badge("可用", "info")
+          : badge("未配置", "")));
+
+    // 能力
+    const caps = m.capabilities || {};
+    const capBits = [];
+    if (caps.map) capBits.push("地图");
+    if (caps.markers) capBits.push("地点标记");
+    if (caps.circle) capBits.push("半径范围");
+    if (caps.route) capBits.push("路线规划");
+    if (caps.externalSite || caps.externalRoute) capBits.push("外部跳转");
+    if (capBits.length) card.appendChild(el("div", { class: "pc-row" }, el("span", { class: "lab" }, "能力："), capBits.join("、")));
+    if (Array.isArray(caps.routeModes) && caps.routeModes.length) {
+      const labels = { driving: "驾车", walking: "步行", transit: "公交", cycling: "骑行" };
       card.appendChild(el("div", { class: "pc-row muted" },
-        mapCfg.amap && mapCfg.amap.js_key_configured
-          ? "高德 Key 已配置（AMAP_JS_KEY）。"
-          : "未配置 AMAP_JS_KEY：地理分析将显示离线示意图（可在 .env 设置后重启生效）。"));
-      card.appendChild(el("div", { class: "pc-row muted" }, "城市：" + ((mapCfg.amap && mapCfg.amap.city) || "—")));
+        "路线方式：" + caps.routeModes.map((x) => labels[x] || x).join("、")));
     }
+    // 配置状态（通用描述，不写死字段）
+    const cs = m.configStatus || {};
+    if (m.id === "amap" && !m.coming_soon) {
+      card.appendChild(el("div", { class: "pc-row muted" },
+        cs.jsKeyConfigured ? "JS Key 已配置。" : "未配置 JS Key：地理分析将显示离线示意图（.env 设置 AMAP_JS_KEY 后重启生效）。"));
+      if (cs.city) card.appendChild(el("div", { class: "pc-row muted" }, "公交默认城市：" + cs.city));
+    }
+
     const btns = el("div", { style: "margin-top:10px" });
-    if (m.coming_soon) {
-      btns.appendChild(el("span", { class: "muted" }, "尚未配置，未来可在此切换。"));
+    if (m.coming_soon || !m.available) {
+      btns.appendChild(el("span", { class: "muted" }, m.coming_soon ? "尚未配置，未来可在此切换。" : "配置所需 Key 后即可启用。"));
     } else {
       btns.appendChild(el("button", {
         class: `btn sm${isActive ? "" : " ghost"}`,
-        disabled: isActive,
-        onClick: () => { setManualMapPlugin(m.id); toast(`已切换到 ${m.label}，回到任务详情即可看到。`, "success"); render(); },
+        disabled: isActive && !manual,
+        onClick: () => { setActiveMapPlugin(m.id); toast(`已切换到 ${m.name}，回到任务详情即可看到。`, "success"); render(); },
       }, isActive ? "当前使用" : "切换到此地图"));
-      if (getManualMapPlugin()) {
+      if (manual) {
         btns.appendChild(el("button", {
           class: "btn sm ghost", style: "margin-left:8px",
-          onClick: () => { setManualMapPlugin(null); toast("已恢复系统默认地图。", "info"); render(); },
+          onClick: () => { setActiveMapPlugin(null); toast("已恢复系统默认地图。", "info"); render(); },
         }, "恢复默认"));
       }
     }

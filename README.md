@@ -94,24 +94,79 @@ LLM_MODEL=gpt-4o-mini
 LONGFLOW_DB=data/longflow.db
 ```
 
-### 地图插件（工作台地理分析）
+### Map Plugin System（工作台地理分析）
 
-地理分析卡片默认使用**高德地图插件（AMap）**展示真实地图、Marker、搜索半径圆，并直接调用高德
-`AMap.Driving / Walking / Transfer / Riding` 做路线规划与绘制；点击「高德地图打开」跳转到高德
-App/网页继续导航。Agent 侧的 Haversine 直线距离与筛选**不依赖地图**，无 Key 时自动回退为内联 SVG
-离线示意图，工作台不崩溃。
+工作台**不绑定任何具体地图 Provider**。地理分析只负责搜索、筛选、Haversine 直线距离与结论；
+地图展示、Marker、半径 Circle、道路路线计算/绘制、外部导航跳转全部交给当前启用的 **Map Plugin**。
+启用哪个插件，地图/路线/绘制/「在地图中打开」就全部走哪个，不会出现混合状态。
 
-```ini
-AMAP_JS_KEY=你的高德Web端Key      # 不配置则显示离线 SVG；建议在高德后台限制 referer
-AMAP_SECURITY_CODE=你的安全密钥   # 新版 JS API 需要；服务端持有，不下发到浏览器
-AMAP_CITY=北京                    # 公交(Transfer)默认城市
+- 默认内置 **高德地图插件（AMap）**，位于 `longflow/web/maps/amap.js`；
+  **Google Maps 插件**（`longflow/web/maps/google.js`）已预留统一接口，当前 Coming Soon。
+- 选择优先级：**用户手动选择（插件页） > 服务端 `map_plugins.active` > 默认可用插件**。
+- 切换插件时会 `destroy()` 旧实例（地图/路线/监听/DOM），避免两个地图并存。
+- 无可用插件或地图加载失败时自动回退内联 SVG 离线示意图，Marker 与 Haversine 直线距离仍可见，工作台不崩溃。
+
+**统一插件接口**（轻量、无继承体系；路线绘制由插件自己完成，MapPanel 不接触任何 Provider API）：
+
+```
+mount(container) / showSites(geoResult, onSelect) / destroy()
+planRoute({ origin, destination, mode }) -> Promise<RouteResult>   # 插件内部算路并绘制
+exitRoute()
+openExternalSite(site) -> URL      openExternalRoute({origin,destination,mode}) -> URL
+getDisplayName() -> "高德地图"      getExternalOpenLabel() -> "在高德地图打开"
+capabilities = { map, markers, circle, route, routeModes, externalSite, externalRoute }
 ```
 
-- 当前启用的地图插件由 `config/longflow.yaml` 的 `map_plugins.active` 决定（默认 `amap`），
-  也可在工作台「插件」页手动切换（优先级：手动选择 > 配置 > 默认）。
-- **Google Maps 插件**已预留位置（`longflow/web/maps/google.js`，当前 Coming Soon）；
-  未来实现同名接口（`mount/showSites/planRoute/exitRoute/openExternal*`）后即可切换，
-  上层地理分析与 Agent 逻辑无需改动。
+统一路线模式：`driving | walking | transit | cycling`（高德内部映射 `transit→AMap.Transfer`、
+`cycling→AMap.Riding`；未来 Google 可映射 `cycling→bicycling`）。`RouteResult` 统一为
+`{ provider, mode, ok, distanceMeters, durationSeconds, summary, steps, raw }`，MapPanel 只消费这些字段。
+
+**第三方接入**：调用 `registerMapPlugin(definition)` 即可，无需改 MapPanel / Agent / Geo Result：
+
+```js
+import { registerMapPlugin } from "./maps/index.js";
+registerMapPlugin({
+  id: "my-map", name: "My Map", version: "1.0.0", available: true,
+  capabilities: { map: true, markers: true, circle: true, route: true,
+    routeModes: ["driving", "walking"], externalSite: true, externalRoute: true },
+  create(config) {
+    return {
+      id: "my-map", available: true,
+      async mount(container) { /* 初始化你的地图 */ },
+      showSites(geo, onSelect) { /* 画中心点/候选/Circle */ },
+      async planRoute({ origin, destination, mode }) {
+        // 调你的路线 API 并在你的地图上绘制，返回统一 RouteResult
+        return { provider: "my-map", mode, ok: true,
+          distanceMeters: 1200, durationSeconds: 900, summary: "1.2 km · 15 min", steps: [] };
+      },
+      exitRoute() {}, destroy() {},
+      openExternalSite(s) { return "https://example.com/..." },
+      openExternalRoute(o) { return "https://example.com/route" },
+      getDisplayName() { return "My Map"; },
+      getExternalOpenLabel() { return "在 My Map 打开"; },
+    };
+  },
+});
+```
+
+### AMap Security Configuration（高德安全配置）
+
+Demo 使用高德 JS API 2.0 的 **securityJsCode 客户端方式**：`AMAP_SECURITY_CODE` 经 `/api/config` 下发，
+在加载 `https://webapi.amap.com/maps...` 的 `<script>` **之前**设置
+`window._AMapSecurityConfig = { securityJsCode }`（顺序由 `loadAMap()` 保证，并有测试守护）。
+
+```ini
+AMAP_JS_KEY=你的高德Web端Key        # 浏览器加载 JS SDK 必需（公开值，务必在高德后台限制 Referer）
+AMAP_SECURITY_CODE=你的安全密钥      # securityJsCode；Demo 客户端方式，下发浏览器但不入日志/仓库
+AMAP_WEB_KEY=你的Web服务Key         # 仅服务器使用，绝不下发浏览器
+AMAP_CITY=北京                      # 公交(transit)默认城市
+```
+
+- `AMAP_JS_KEY` 是前端加载 SDK 所需的公开 Web Key，不要误当服务器密钥；`AMAP_WEB_KEY` 是
+  Web Service Key，**保持服务器端**，public config 中刻意不含它。
+- 不主动 `console.log` 密钥、不写死代码、不进仓库；`.env` 已在 `.gitignore`。
+- **生产部署建议**改用 `serviceHost` 代理模式（`window._AMapSecurityConfig = { serviceHost: "/_AMapService" }`），
+  本版不实现该代理后端，但 `loadAMap()` 已支持传入 `serviceHost`，未来可平滑切换。
 
 ---
 

@@ -37,12 +37,16 @@ _DEFAULTS: dict[str, Any] = {
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
-    out = dict(base)
+    """深合并：结果中的嵌套 dict 均为新建副本，绝不与 base（如 _DEFAULTS）共享，
+    避免对返回 cfg 的 setdefault/env 写入跨多次 load_config 累积造成配置污染。"""
+    out = {}
+    for k, v in base.items():
+        out[k] = _deep_merge(v, {}) if isinstance(v, dict) else v
     for k, v in (override or {}).items():
         if isinstance(v, dict) and isinstance(out.get(k), dict):
             out[k] = _deep_merge(out[k], v)
         else:
-            out[k] = v
+            out[k] = _deep_merge(v, {}) if isinstance(v, dict) else v
     return out
 
 
@@ -69,10 +73,15 @@ def load_config(path: Path | str | None = None) -> dict[str, Any]:
     # Key 只从环境变量读取，不写死、不入仓库、不入日志。
     mp = cfg.setdefault("map_plugins", {})
     amap = mp.setdefault("amap", {})
+    # AMAP_JS_KEY：浏览器加载高德 JS SDK 所需的 Web 端 Key（由高德后台限制 referer）。
+    # AMAP_WEB_KEY：服务端 Web Service Key，仅服务器使用，绝不下发浏览器、不兜底为 JS key。
     if os.getenv("AMAP_JS_KEY"):
         amap["js_key"] = os.environ["AMAP_JS_KEY"]
-    elif os.getenv("AMAP_WEB_KEY"):
-        amap["js_key"] = os.environ["AMAP_WEB_KEY"]
+    if os.getenv("AMAP_WEB_KEY"):
+        amap["web_key"] = os.environ["AMAP_WEB_KEY"]
+    # AMAP_SECURITY_CODE：高德 JS API 2.0 的 securityJsCode。Demo 采用客户端方式，
+    # 需要在浏览器加载 SDK 前设置 window._AMapSecurityConfig，因此下发到前端；
+    # 不写死代码/仓库、不入日志。生产建议改用 serviceHost 代理（见 README）。
     if os.getenv("AMAP_SECURITY_CODE"):
         amap["security_code"] = os.environ["AMAP_SECURITY_CODE"]
     if os.getenv("AMAP_CITY"):
@@ -122,17 +131,23 @@ def public_config(cfg: dict) -> dict:
 
 
 def public_map_plugins(mp: dict) -> dict:
-    """暴露给前端的地图插件配置：JS key 需要下发（前端加载 SDK），
-    security_code 属服务端安全密钥，绝不暴露给前端/日志。"""
+    """暴露给前端的地图插件配置（仅前端加载/渲染地图实际需要的字段）。
+
+    - js_key：浏览器加载高德 JS SDK 的 Web 端 Key（公开值，应由高德后台限制 referer），需下发。
+    - security_code：高德 JS API 2.0 securityJsCode，Demo 采用客户端方式，必须在加载 SDK 前
+      设置 window._AMapSecurityConfig，故 Demo 下下发浏览器（不写死、不入日志）；生产可改 serviceHost。
+    - web_key（AMAP_WEB_KEY）：服务端 Web Service Key，绝不下发浏览器。
+    """
     def _amap(d: dict) -> dict:
         return {
             "enabled": bool(d.get("enabled")),
-            # JS API key 是前端加载用的公开 Web Key（应由高德后台限制 referer）；
-            # 运行时下发到浏览器，不写死代码/仓库；security_code 属服务端密钥绝不下发。
             "js_key": d.get("js_key", ""),
             "js_key_configured": bool(d.get("js_key")),
+            # Demo：securityJsCode 客户端方式需要该值（生产建议 serviceHost 代理）
+            "security_code": d.get("security_code", ""),
             "security_configured": bool(d.get("security_code")),
             "city": d.get("city", ""),
+            # 注意：web_key（Web Service Key）刻意不包含，保持服务器端。
         }
     return {
         "active": mp.get("active", "amap"),
