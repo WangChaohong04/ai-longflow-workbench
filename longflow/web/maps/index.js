@@ -36,6 +36,9 @@ export const MAP_ROUTE_MODES = [
 
 const _registry = new Map(); // id -> definition
 
+// 用户在插件页手动选择的地图插件（localStorage；须在使用前声明，避免 TDZ）。
+const MANUAL_KEY = "longflow.mapPlugin";
+
 /** 注册一个地图插件（内置或第三方）。definition 见文件头注释。 */
 export function registerMapPlugin(definition) {
   if (!definition || !definition.id || typeof definition.create !== "function") {
@@ -46,6 +49,11 @@ export function registerMapPlugin(definition) {
 
 export function getMapPluginDefinition(id) {
   return _registry.get(id) || null;
+}
+
+/** 反注册地图插件（测试/热卸载第三方插件用）。 */
+export function unregisterMapPlugin(id) {
+  return _registry.delete(id);
 }
 
 /** 实例是否可用：definition 未明确 available:false 且 create() 成功返回实例时默认可用；
@@ -102,8 +110,6 @@ export function getActiveMapPlugin(publicMapConfig = {}) {
     return inst && inst.available !== false ? inst : null;
   } catch { return null; }
 }
-
-const MANUAL_KEY = "longflow.mapPlugin";
 
 export function setActiveMapPlugin(id) {
   try {
