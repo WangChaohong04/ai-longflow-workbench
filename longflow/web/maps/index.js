@@ -48,19 +48,28 @@ export function getMapPluginDefinition(id) {
   return _registry.get(id) || null;
 }
 
+/** 实例是否可用：definition 未明确 available:false 且 create() 成功返回实例时默认可用；
+ * 实例可在运行时额外声明 available:false（如缺少 AMap JS Key）。 */
+function _instanceAvailable(def, pluginCfg) {
+  if (!def || def.available === false || def.coming_soon) return false;
+  try {
+    const inst = def.create(pluginCfg || {});
+    if (!inst) return false;
+    return inst.available !== false; // undefined => 默认可用
+  } catch { return false; }
+}
+
 /** 列出所有已注册地图插件的元数据（含是否可用、能力、配置状态）。 */
 export function listMapPlugins(publicMapConfig = {}) {
   const cfg = publicMapConfig || {};
   return [..._registry.values()].map((def) => {
     const pluginCfg = cfg[def.id] || {};
-    let available = false;
-    try { available = def.available !== false && !!def.create(pluginCfg).available; } catch { available = false; }
     return {
       id: def.id,
       name: def.name,
       version: def.version || "",
       builtin: !!def.builtin,
-      available,
+      available: _instanceAvailable(def, pluginCfg),
       coming_soon: !!def.coming_soon,
       active: false, // 由调用方按当前选择填充
       capabilities: def.capabilities || {},
@@ -77,23 +86,21 @@ export function getActiveMapPluginId(publicMapConfig = {}) {
   try { manual = localStorage.getItem(MANUAL_KEY); } catch { /* ignore */ }
   const order = [manual, cfg.active, ..._registry.keys()].filter(Boolean);
   for (const id of order) {
-    const def = _registry.get(id);
-    if (!def || def.available === false || def.coming_soon) continue;
-    const pluginCfg = cfg[id] || {};
-    let inst = null;
-    try { inst = def.create(pluginCfg); } catch { continue; }
-    if (inst.available) return id;
+    if (_instanceAvailable(_registry.get(id), cfg[id] || {})) return id;
   }
   return null;
 }
 
 /** 获取当前启用插件的实例；无可用插件返回 null（上层回退内联 SVG）。 */
 export function getActiveMapPlugin(publicMapConfig = {}) {
-  const id = getActiveMapPluginId(publicMapConfig);
+  const cfg = publicMapConfig || {};
+  const id = getActiveMapPluginId(cfg);
   if (!id) return null;
   const def = _registry.get(id);
-  const inst = def.create((publicMapConfig || {})[id] || {});
-  return inst.available ? inst : null;
+  try {
+    const inst = def.create(cfg[id] || {});
+    return inst && inst.available !== false ? inst : null;
+  } catch { return null; }
 }
 
 const MANUAL_KEY = "longflow.mapPlugin";

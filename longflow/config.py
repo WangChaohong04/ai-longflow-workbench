@@ -130,27 +130,59 @@ def public_config(cfg: dict) -> dict:
     }
 
 
-def public_map_plugins(mp: dict) -> dict:
-    """暴露给前端的地图插件配置（仅前端加载/渲染地图实际需要的字段）。
+# 各地图插件可下发浏览器的字段白名单（其余字段——尤其服务端密钥——绝不公开）。
+# 内置高德：JS SDK 前端加载需要 js_key 与（Demo securityJsCode 模式）security_code。
+_PUBLIC_MAP_FIELDS: dict[str, set[str]] = {
+    "amap": {"enabled", "js_key", "js_key_configured", "security_code", "security_configured", "city"},
+    "google": {"enabled", "coming_soon"},
+}
 
-    - js_key：浏览器加载高德 JS SDK 的 Web 端 Key（公开值，应由高德后台限制 referer），需下发。
-    - security_code：高德 JS API 2.0 securityJsCode，Demo 采用客户端方式，必须在加载 SDK 前
-      设置 window._AMapSecurityConfig，故 Demo 下下发浏览器（不写死、不入日志）；生产可改 serviceHost。
-    - web_key（AMAP_WEB_KEY）：服务端 Web Service Key，绝不下发浏览器。
+
+def public_map_plugins(mp: dict) -> dict:
+    """暴露给前端的地图插件配置。
+
+    - 内置插件按 _PUBLIC_MAP_FIELDS 白名单精确下发；
+    - 第三方插件默认只下发 enabled；需额外字段时在 map_plugins.<id>.public_fields
+      显式声明字段名（值取自该插件配置），避免把服务端密钥/原始配置整体公开；
+    - AMAP_WEB_KEY 等服务端密钥不在任何白名单内，绝不下发。
+
+    高德：js_key 为浏览器加载 SDK 的公开 Web Key（应在高德后台限制 Referer）；
+    security_code 为 JS API 2.0 securityJsCode，Demo 客户端方式需在加载 SDK 前设置
+    window._AMapSecurityConfig，故下发（不写死、不入日志）；生产可改 serviceHost 代理。
     """
-    def _amap(d: dict) -> dict:
-        return {
-            "enabled": bool(d.get("enabled")),
-            "js_key": d.get("js_key", ""),
-            "js_key_configured": bool(d.get("js_key")),
-            # Demo：securityJsCode 客户端方式需要该值（生产建议 serviceHost 代理）
-            "security_code": d.get("security_code", ""),
-            "security_configured": bool(d.get("security_code")),
-            "city": d.get("city", ""),
-            # 注意：web_key（Web Service Key）刻意不包含，保持服务器端。
-        }
-    return {
-        "active": mp.get("active", "amap"),
-        "amap": _amap(mp.get("amap") or {}),
-        "google": {"enabled": bool((mp.get("google") or {}).get("enabled")), "coming_soon": True},
+    # 内置插件的字段默认值（保证前端拿到稳定结构）
+    _DEFAULTS_OUT = {
+        "amap": {"enabled": True, "js_key": "", "js_key_configured": False,
+                 "security_code": "", "security_configured": False, "city": ""},
+        "google": {"enabled": False, "coming_soon": True},
     }
+
+    def _whitelisted(plugin_id: str, d: dict) -> dict:
+        allowed = set(_PUBLIC_MAP_FIELDS.get(plugin_id, set()))
+        # 第三方显式声明的可公开字段
+        extra = d.get("public_fields")
+        if isinstance(extra, (list, tuple)):
+            allowed |= {str(x) for x in extra
+                        if not str(x).startswith(("_", "web_"))
+                        and not any(s in str(x).lower() for s in ("secret", "token", "api_key", "password"))}
+        out = dict(_DEFAULTS_OUT.get(plugin_id, {"enabled": bool(d.get("enabled", plugin_id == "amap"))}))
+        for k in sorted(allowed):
+            if k in d:
+                out[k] = d[k]
+        # 派生标志
+        if "js_key_configured" in allowed:
+            out["js_key_configured"] = bool(d.get("js_key"))
+        if "security_configured" in allowed:
+            out["security_configured"] = bool(d.get("security_code"))
+        return out
+
+    out = {"active": mp.get("active", "amap")}
+    for plugin_id, d in mp.items():
+        if plugin_id in ("active", "public_fields") or not isinstance(d, dict):
+            continue
+        out[plugin_id] = _whitelisted(plugin_id, d)
+    # google 占位（coming_soon 前端固定，不依赖配置）
+    out.setdefault("google", {"enabled": False, "coming_soon": True})
+    if "google" in out:
+        out["google"]["coming_soon"] = True
+    return out
