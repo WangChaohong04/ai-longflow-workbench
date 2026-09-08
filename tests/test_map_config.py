@@ -58,10 +58,68 @@ def test_no_security_code_when_unset(amap_env):
     assert amap["security_configured"] is False
 
 
-def test_secrets_not_in_repr_loggable(monkeypatch):
-    """T5: 配置加载/展示路径不主动打印密钥（public_config 输出不含 web key）。"""
+def test_server_secret_not_in_public_repr(monkeypatch):
+    """公开配置不包含服务端 Web Service Key；Demo 的 securityJsCode 会按设计下发浏览器。"""
     monkeypatch.setenv("AMAP_WEB_KEY", "WEB_SECRET_999")
     monkeypatch.setenv("AMAP_SECURITY_CODE", "SEC_456")
     pub = public_config(load_config())
     printed = str(pub)
     assert "WEB_SECRET_999" not in printed
+    assert "SEC_456" in printed
+    # web_key 名本身也不应出现在公开结构
+    assert "web_key" not in str(pub["map_plugins"])
+
+
+def test_third_party_plugin_config_whitelist(amap_env):
+    """第三方插件配置：默认只下发 enabled；public_fields 白名单字段可下发，密钥不下发。"""
+    mp = {
+        "active": "my-map",
+        "amap": {"enabled": True, "js_key": "", "security_code": "", "city": "北京"},
+        "google": {"enabled": False, "coming_soon": True},
+        "my-map": {
+            "enabled": True,
+            "api_key": "THIRD_PARTY_SECRET",
+            "token": "TOK_SECRET",
+            "endpoint": "https://tiles.example.com",
+            "style": "dark",
+            "public_fields": ["endpoint", "style"],
+        },
+    }
+    pub = public_map_plugins(mp)
+    my = pub["my-map"]
+    assert my.get("endpoint") == "https://tiles.example.com"
+    assert my.get("style") == "dark"
+    assert my.get("enabled") is True
+    # 敏感字段即使被列出也不得下发
+    assert "api_key" not in my and "token" not in my
+    blob = str(pub)
+    assert "THIRD_PARTY_SECRET" not in blob and "TOK_SECRET" not in blob
+
+
+def test_third_party_plugin_no_whitelist_only_enabled(amap_env):
+    """第三方插件未声明 public_fields 时，不把原始配置整体下发。"""
+    mp = {
+        "active": "other-map",
+        "other-map": {"enabled": True, "secret": "S", "endpoint": "https://x"},
+    }
+    pub = public_map_plugins(mp)
+    other = pub["other-map"]
+    assert other.get("enabled") is True
+    assert "secret" not in other and "endpoint" not in other
+
+
+def test_amap_whitelist_exact_fields(amap_env):
+    """amap 公开字段严格限定为白名单，web_key 永远不在内。"""
+    amap_env.setenv("AMAP_JS_KEY", "JS")
+    amap_env.setenv("AMAP_WEB_KEY", "WEBK")
+    amap_env.setenv("AMAP_SECURITY_CODE", "SEC")
+    cfg = load_config()
+    # 模拟服务端 web_key 进入内部配置
+    cfg["map_plugins"]["amap"]["web_key"] = "WEBK"
+    pub = public_map_plugins(cfg["map_plugins"])["amap"]
+    assert set(pub.keys()) == {
+        "enabled", "js_key", "js_key_configured",
+        "security_code", "security_configured", "city",
+    }
+    assert "web_key" not in pub
+    assert pub["js_key"] == "JS" and pub["security_code"] == "SEC"
