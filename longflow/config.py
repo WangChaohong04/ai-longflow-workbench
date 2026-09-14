@@ -23,6 +23,12 @@ _DEFAULTS: dict[str, Any] = {
         "tick_interval_seconds": 2,
         "tool_timeout_seconds": 30,
         "max_verify_rounds": 2,
+        "max_node_retries": 2,
+        "max_parallel_subagents": 3,
+        "max_upload_bytes": 20_000_000,
+        "max_extracted_bytes": 40_000_000,
+        "upload_timeout_seconds": 30,
+        "parse_timeout_seconds": 15,
     },
     "server": {"host": "127.0.0.1", "port": 8765},
     "human_channel": None,  # 人工交接渠道；未配置时如实告知用户
@@ -66,6 +72,19 @@ def load_config(path: Path | str | None = None) -> dict[str, Any]:
     if os.getenv("LLM_MODEL"):
         cfg["llm"]["model"] = os.environ["LLM_MODEL"]
     cfg["llm"]["api_key"] = os.getenv("LLM_API_KEY", "")  # 只保留在内存
+    if os.getenv("LONGFLOW_SEARCH_ENDPOINT"):
+        cfg["search_endpoint"] = os.environ["LONGFLOW_SEARCH_ENDPOINT"]
+    if os.getenv("LONGFLOW_SEARCH_BAIDU_KEY"):
+        cfg["search_baidu_key"] = os.environ["LONGFLOW_SEARCH_BAIDU_KEY"]  # 正式 API key，仅内存
+    if os.getenv("LONGFLOW_SEARCH_BAIDU_HEADER"):
+        cfg["search_baidu_header"] = os.environ["LONGFLOW_SEARCH_BAIDU_HEADER"]
+    if os.getenv("LONGFLOW_SEARCH_KIND"):
+        cfg["search_kind"] = os.environ["LONGFLOW_SEARCH_KIND"]  # baidu_api | baidu_page
+    if os.getenv("LONGFLOW_SEARCH_ALLOWED_DOMAINS"):
+        cfg["allowed_domains"] = [x.strip() for x in os.environ[
+            "LONGFLOW_SEARCH_ALLOWED_DOMAINS"].split(",") if x.strip()]
+    if os.getenv("LONGFLOW_SEARCH_FETCH_CONTENT"):
+        cfg["search_fetch_content"] = os.environ["LONGFLOW_SEARCH_FETCH_CONTENT"].lower() in ("1", "true")
     cfg["db_path"] = os.getenv("LONGFLOW_DB") or str(REPO_ROOT / "data" / "longflow.db")
 
     # 地图插件 Key（前端工作台展示/路线/跳转用；Agent 地理分析不依赖地图）。

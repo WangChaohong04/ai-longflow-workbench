@@ -10,13 +10,20 @@ PENDING = "pending"
 READY = "ready"
 IN_PROGRESS = "in_progress"
 WAITING_APPROVAL = "waiting_approval"
-WAITING_EVENT = "waiting_event"
+WAITING_EVENT = "waiting_event"      # 通用等待（向后兼容旧数据）
+WAITING_USER = "waiting_user"        # 等待用户补充信息/澄清/确认
+WAITING_EXTERNAL = "waiting_external"  # 等待外部系统（人工渠道/第三方回调）
+RETRYING = "retrying"                # 可恢复失败后的重试中
+PARTIALLY_COMPLETED = "partially_completed"  # 部分分支成功、部分阻塞
 COMPLETED = "completed"
 FAILED = "failed"
 CANCELLED = "cancelled"
 
 TERMINAL_STATUSES = {COMPLETED, FAILED, CANCELLED}
-WAITING_STATUSES = {WAITING_APPROVAL, WAITING_EVENT}
+# 所有挂起等待状态：调度器不空转推进，等待对应事件唤醒
+WAITING_STATUSES = {WAITING_APPROVAL, WAITING_EVENT, WAITING_USER, WAITING_EXTERNAL}
+# 非终态、可被恢复循环/用户输入唤醒
+RESUMABLE_STATUSES = WAITING_STATUSES | {RETRYING, PARTIALLY_COMPLETED, READY, PENDING}
 
 # 角色
 ROLE_CONTROLLER = "controller"
@@ -37,6 +44,10 @@ STATUS_LABELS = {
     IN_PROGRESS: "进行中",
     WAITING_APPROVAL: "待审批",
     WAITING_EVENT: "等待中",
+    WAITING_USER: "待用户处理",
+    WAITING_EXTERNAL: "等待外部",
+    RETRYING: "重试中",
+    PARTIALLY_COMPLETED: "部分完成",
     COMPLETED: "已完成",
     FAILED: "失败",
     CANCELLED: "已取消",

@@ -4,6 +4,15 @@ description: 基于地理空间检索的选址/场地推荐（半径筛选、距
 knowledge:
   - knowledge/geo_site/*.md
 
+# 领域包元数据（总路由/治理使用；新增领域只需增配本段，不改核心）
+domain:
+  name: 选址与地理分析
+  semantic_hints: [公里, 千米, km, 多远, 怎么走, 路线, 导航, 咖啡馆, 餐厅, 酒店,
+                   加油站, 充电站, 仓库, 经销商, 门店, 点位, 经纬度, 坐标, 通勤]
+  subagents: [geo_researcher, official_source_researcher, evidence_verifier, normalizer]
+  risk: low
+  pause_conditions: [关键槽位缺失(中心地点), 无外部路线/地图服务时道路通勤能力不足, 证据冲突, subagent 失败或超时]
+
 intent_keywords:
   选址: [选址, 场地, 找地方, 办公点]
   附近: [附近, 周边, 半径, 多远, 距离]

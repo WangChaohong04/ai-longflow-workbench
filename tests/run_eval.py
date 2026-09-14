@@ -219,7 +219,7 @@ def chk_status(ctx, expected):
 
 def chk_terminal_not_pending(ctx, _=True):
     status = (ctx["final"]["root"] or {}).get("status", "<missing>")
-    if status in TERMINAL or status == "waiting_event":
+    if status in TERMINAL or status in ("waiting_event", "waiting_user", "waiting_external"):
         return True, f"root 已决：status={status}"
     return False, f"root 未决：status={status}（steps={ctx.get('steps')}）"
 
@@ -256,10 +256,16 @@ def chk_verified_true(ctx, _=True):
     return False, f"verified={v!r}；gate_problems={json.dumps(res.get('gate_problems'), ensure_ascii=False)[:400]}"
 
 
-def chk_verified_not_true(ctx, _=True):
+def chk_verified_not_true(ctx, expect=True):
     v = _verified(ctx["final"]["root"])
     conflicts = _result_conflicts(ctx["final"]["root"])
-    if v is not True or conflicts:
+    not_verified = (v is not True) or bool(conflicts)
+    if expect is False:
+        # 期望核验通过（现行有效资料无冲突，如过期版本被正确排除）
+        if v is True and not conflicts:
+            return True, f"verified={v!r}，conflicts=0（现行版本核验通过）"
+        return False, f"期望核验通过，但 verified={v!r}，conflicts={len(conflicts)}"
+    if not_verified:
         return True, f"verified={v!r}，conflicts={len(conflicts)} 处（冲突未作为已验证结论放行）"
     return False, "verified=true 但存在来源冲突应标注/不放行"
 
@@ -342,10 +348,14 @@ def chk_no_evidence_ack(ctx, _=True):
     return True, "明确无法确认/未找到依据，且未编造条款"
 
 
-def chk_conflict_flagged(ctx, _=True):
+def chk_conflict_flagged(ctx, expect=True):
     conflicts = _result_conflicts(ctx["final"]["root"])
+    if expect is False:
+        if not conflicts:
+            return True, "现行有效资料无来源冲突（过期版本已排除）"
+        return False, f"不应有冲突却检出 {len(conflicts)} 处：{json.dumps(conflicts, ensure_ascii=False)[:300]}"
     text = _answer_of(ctx["final"]["root"], ctx["final"]["events"])
-    text_flag = any(k in text for k in ("冲突", "不一致", "两个版本", "版本", "矛盾", "差异"))
+    text_flag = any(k in text for k in ("冲突", "不一致", "两个版本", "矛盾", "差异"))
     if conflicts or text_flag:
         return True, f"来源冲突已标注（conflicts={len(conflicts)}，文本标注={text_flag}）"
     return False, f"未标注来源冲突；result={json.dumps(_result_of(ctx['final']['root']), ensure_ascii=False)[:300]}"

@@ -4,6 +4,14 @@ description: 团队行政知识问答与多步骤任务（采购/报销/规则�
 knowledge:
   - knowledge/team_ops/*.md
 
+# 领域包元数据（总路由/治理使用）
+domain:
+  name: 团队行政
+  semantic_hints: [行政, 人事, 财务, 采购, 报销, 差旅, 住宿, 假期, 供应商, 预算, 审批, 通知, 办公用品]
+  subagents: [rag_researcher, official_source_researcher, evidence_verifier, normalizer, comparison_agent]
+  risk: medium
+  pause_conditions: [采购物品/预算缺失, 金额超审批线, 供应商不在名录, 证据冲突或过期, 高风险下单待审批]
+
 intent_keywords:
   采购: [采购, 购买, 下单, 添置, 申购]
   报销: [报销, 费用报销, 贴票, 报账]

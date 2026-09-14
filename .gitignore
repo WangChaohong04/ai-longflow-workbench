@@ -1,5 +1,5 @@
 # ---- 运行时数据 / 数据库 / 日志 ----
-data/
+/data/
 *.db
 *.db-shm
 *.db-wal
@@ -24,6 +24,10 @@ env/
 
 # ---- 测试 / 评测临时工作目录 ----
 .lfwork/
+.agent-teams/
+node_modules/
+playwright-report/
+test-results/
 .pytest-tmp/
 .pytest-tmp2/
 .pytest_cache/

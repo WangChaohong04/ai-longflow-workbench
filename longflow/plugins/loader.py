@@ -149,6 +149,28 @@ def collect_knowledge(loaded: list[LoadedPlugin]) -> list[tuple[list[dict], Load
     return out
 
 
+def collect_domains(loaded: list[LoadedPlugin]) -> list[tuple[Any, LoadedPlugin]]:
+    """从已加载插件收集领域包（DomainPack 或等价 dict）。
+
+    插件通过可选的 ``get_domains()`` 注册领域；核心编排不 import 任何具体领域，
+    与 collect_tools/collect_knowledge 一致：插件缺失该方法时返回空，失败只隔离自身。
+    """
+    out: list[tuple[Any, LoadedPlugin]] = []
+    for lp in loaded:
+        if lp.instance is None or lp.error:
+            continue
+        getter = getattr(lp.instance, "get_domains", None)
+        if not callable(getter):
+            continue
+        try:
+            for pack in getter() or []:
+                if pack is not None:
+                    out.append((pack, lp))
+        except Exception as exc:  # noqa: BLE001
+            lp.error = f"get_domains 失败: {str(exc)[:200]}"
+    return out
+
+
 def dispatch_event(loaded: list[LoadedPlugin], kind: str, detail: dict) -> None:
     for lp in loaded:
         if lp.instance is None or lp.error:

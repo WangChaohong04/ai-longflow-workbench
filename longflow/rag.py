@@ -86,6 +86,44 @@ def _extract_citations(section: str, body: str) -> list[str]:
     return out
 
 
+_META_DATE = __import__("re").compile(r"(20\d{2})[-年](\d{1,2})[-月](\d{1,2})")
+
+
+def _doc_meta(text: str, fallback_name: str = "") -> dict:
+    """从 Markdown 头部解析 版本/生效日期/失效日期（用于知识时效过滤）。"""
+    import re as _re
+    head = (text or "")[:600]
+    version = ""
+    mv = _re.search(r"版本[：:]\s*(v?[0-9][0-9A-Za-z.\-]*)", head)
+    if mv:
+        version = mv.group(1)
+    elif fallback_name:
+        my = _re.search(r"20\d{2}", fallback_name)
+        version = my.group(0) if my else ""
+
+    def _date_after(label):
+        m = _re.search(label + r"[：:]?\s*(20\d{2})\D(\d{1,2})\D(\d{1,2})", head)
+        if not m:
+            return None
+        y, mo, d = m.groups()
+        return f"{int(y):04d}-{int(mo):02d}-{int(d):02d}"
+
+    effective = _date_after("生效日期") or _date_after("生效")
+    expires = _date_after("失效日期") or _date_after("失效")
+    return {"version": version, "effective_at": effective, "expires_at": expires}
+
+
+def _ensure_rag_cols(conn):
+    """幂等迁移：为 knowledge_chunks 增加版本/生效/失效列。"""
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(knowledge_chunks)").fetchall()}
+    for col, ddl in (("version", "TEXT DEFAULT ''"),
+                     ("effective_at", "TEXT"),
+                     ("expires_at", "TEXT")):
+        if col not in have:
+            conn.execute(f"ALTER TABLE knowledge_chunks ADD COLUMN {col} {ddl}")
+    conn.commit()
+
+
 def load_knowledge_path(
     conn: sqlite3.Connection,
     pattern: str,
@@ -116,16 +154,18 @@ def load_knowledge_path(
                 str(stat.st_mtime),
             ),
         )
+        _ensure_rag_cols(conn)
         if ext in (".md", ".txt"):
             text = p.read_text(encoding="utf-8")
+            meta = _doc_meta(text, p.name)
             for section, body in _split_sections(text):
                 citations = _extract_citations(section, body)
                 for chunk_text in _chunk_body(body):
                     conn.execute(
                         """INSERT INTO knowledge_chunks
                            (id, source_id, doc_name, section, text, fields_json,
-                            citations_json, scenario)
-                           VALUES (?,?,?,?,?,?,?,?)""",
+                            citations_json, scenario, version, effective_at, expires_at)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             db.new_id("kc"),
                             source_id,
@@ -135,6 +175,7 @@ def load_knowledge_path(
                             "{}",
                             json.dumps(citations, ensure_ascii=False),
                             scenario,
+                            meta["version"], meta["effective_at"], meta["expires_at"],
                         ),
                     )
                     count += 1
@@ -227,18 +268,42 @@ def search(
     scenario: str | None = None,
     fields: dict | None = None,
     top_k: int = 5,
+    include_expired: bool = False,
+    as_of: str | None = None,
+    scenario_like: str | None = None,
 ) -> list[dict]:
-    """关键词 BM25 + 业务字段过滤 + 重排（条款/字段命中加权）。"""
-    rows = conn.execute(
-        "SELECT * FROM knowledge_chunks WHERE (? IS NULL OR scenario=?)",
-        (scenario, scenario),
-    ).fetchall()
+    """关键词 BM25 + 业务字段过滤 + 知识时效过滤 + 重排（条款/字段命中加权）。
+
+    默认只召回 as_of（默认今天）处于 [effective_at, expires_at] 有效期内、
+    或未标注时效的知识；已失效资料（如旧年度政策）不参与回答，避免用过时数字。
+    """
+    _ensure_rag_cols(conn)
+    from datetime import datetime, timezone
+    today = as_of or datetime.now(timezone.utc).date().isoformat()
+    if scenario_like is not None:
+        rows = conn.execute(
+            "SELECT * FROM knowledge_chunks WHERE scenario LIKE ? ESCAPE '\\'",
+            (scenario_like,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM knowledge_chunks WHERE (? IS NULL OR scenario=?)",
+            (scenario, scenario),
+        ).fetchall()
+    colset = {row["name"] for row in conn.execute("PRAGMA table_info(knowledge_chunks)").fetchall()}
     candidates = []
     for r in rows:
         row_fields = json.loads(r["fields_json"] or "{}")
         if fields:
             if not all(str(row_fields.get(k)) == str(v) for k, v in fields.items()):
                 continue
+        if not include_expired:
+            eff = r["effective_at"] if "effective_at" in colset else None
+            exp = r["expires_at"] if "expires_at" in colset else None
+            if eff and eff > today:
+                continue  # 尚未生效
+            if exp and exp < today:
+                continue  # 已失效
         candidates.append(r)
     if not candidates:
         return []
@@ -300,10 +365,84 @@ def search(
                 "citations": json.loads(r["citations_json"] or "[]"),
                 "fields": json.loads(r["fields_json"] or "{}"),
                 "scenario": r["scenario"],
+                "version": r["version"] if "version" in r.keys() else "",
+                "expires_at": (r["expires_at"] if "expires_at" in r.keys() else None),
             }
         )
     return out
 
+
+
+# 同义词/上位词扩展（确定性，预算内只改写一次）：首轮召回不足时放宽检索。
+_SYNONYMS = {
+    "住宿": ["住宿", "酒店", "宾馆"],
+    "酒店": ["住宿", "酒店"],
+    "宾馆": ["住宿", "宾馆"],
+    "差旅": ["差旅", "出差"],
+    "出差": ["差旅", "出差"],
+    "采购": ["采购", "购买", "申购"],
+    "报销": ["报销", "费用", "补贴"],
+    "补贴": ["补贴", "报销", "补助"],
+    "补助": ["补助", "补贴"],
+}
+
+
+def rewrite_query(query: str) -> str:
+    """确定性查询改写：把命中的业务词替换/扩展为同义词，以放宽第二轮召回。"""
+    out = set((query or "").split())
+    expanded = query or ""
+    added = []
+    for word, syns in _SYNONYMS.items():
+        if word in (query or ""):
+            for s in syns:
+                if s not in expanded:
+                    added.append(s)
+                    expanded = f"{expanded} {s}"
+    return expanded.strip()
+
+
+def search_staged(
+    conn,
+    query: str,
+    *,
+    scenario: str | None = None,
+    fields: dict | None = None,
+    top_k: int = 5,
+    max_rounds: int = 2,
+) -> dict:
+    """按需分段检索：先用原查询 BM25+字段过滤；首轮召回为空/不足时，在预算内
+    改写/扩召回至多 max_rounds 轮。返回 {chunks, stages:[{round,query,hits,elapsed_ms}]}。
+
+    - 每阶段记录命中数与耗时（可观察）。
+    - BM25 分数仅用于排序，绝不当作答案正确概率。
+    - 语义检索为可选扩展，本实现不引入向量库。
+    """
+    import time as _time
+    stages = []
+    seen_ids: set = set()
+    merged: list[dict] = []
+    q = query
+    for rnd in range(1, max(1, max_rounds) + 1):
+        t0 = _time.monotonic()
+        hits = search(conn, q, scenario=scenario, fields=fields, top_k=top_k)
+        elapsed = int((_time.monotonic() - t0) * 1000)
+        new = [h for h in hits if h["chunk_id"] not in seen_ids]
+        for h in new:
+            seen_ids.add(h["chunk_id"])
+            merged.append(h)
+        stages.append({"round": rnd, "query": q, "hits": len(hits),
+                       "new_hits": len(new), "elapsed_ms": elapsed,
+                       "rewritten": rnd > 1})
+        # 首轮已有足够召回即停（预算化，不无谓扩召回）
+        if len(merged) >= top_k or rnd >= max_rounds:
+            break
+        nq = rewrite_query(q)
+        if nq == q:
+            break  # 无可改写空间
+        q = nq
+    # 按分数稳定排序后截断
+    merged.sort(key=lambda c: c.get("score", 0), reverse=True)
+    return {"chunks": merged[:top_k], "count": len(merged[:top_k]), "stages": stages}
 
 def load_all(conn, root=None, *args, **kwargs) -> int:
     """加载所有已配置场景的知识（评测/预热入口）。root 参数忽略，兼容多签名探测。"""

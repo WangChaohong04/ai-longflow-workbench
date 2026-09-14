@@ -223,7 +223,10 @@ class BackendSession:
         self._plugins = self.loader_mod.load_plugins(cfg)
         for tool_spec, lp in self.loader_mod.collect_tools(self._plugins):
             plugin_cfg = (cfg.get("plugins", {}).get(lp.name, {}) or {}).get("config", {})
-            self.registry.register(tool_spec, data_dir=lp.data_dir, config=plugin_cfg)
+            try:
+                self.registry.register(tool_spec, data_dir=lp.data_dir, config=plugin_cfg)
+            except ValueError as exc:
+                self.notes.append(f"插件工具重名已隔离({lp.name}): {exc}")
         for chunks, lp in self.loader_mod.collect_knowledge(self._plugins):
             try:
                 self.rag_mod.load_plugin_knowledge(self.conn, chunks, scenario=f"plugin:{lp.name}")

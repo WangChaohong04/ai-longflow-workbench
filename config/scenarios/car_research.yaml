@@ -1,0 +1,55 @@
+# 领域包：汽车研究（只读研究闭环；不接真实下单/付款/外发）
+# 演示 Coordinator 的动态任务图：先澄清能源类型；"全部比较"展开燃油/纯电/插混/增程四分支。
+name: car_research
+description: 家用车选购研究（预算/能源类型/用途/维度对照，只读研究与事实对照）
+knowledge: []
+
+domain:
+  name: 汽车研究
+  semantic_hints: [汽车, 家用车, 购车, 选车, 车型, 轿车, SUV, 新能源, 燃油, 纯电, 插混, 增程, 续航, 油耗, 预算, 万以内, 落地价, 4S店]
+  # 只读研究/分析固定能力（不含下单/付款）
+  subagents: [official_source_researcher, forum_researcher, web_researcher, normalizer, evidence_verifier, comparison_agent]
+  risk: medium
+  pause_conditions: [能源类型缺失, 预算缺失, 比较维度缺失, 证据冲突或过期, 来源不可达, 任何真实下单/付款动作]
+  # 分支声明：Coordinator 据此展开（核心不写死汽车）
+  branch_on:
+    slot: energy_type
+    options:
+      - {value: icev, label: 燃油车, aliases: [燃油, 汽油车, 油车]}
+      - {value: bev,  label: 纯电车, aliases: [纯电, 电动, 电车, EV]}
+      - {value: phev, label: 插电混动, aliases: [插混, 插电, 混动, PHEV]}
+      - {value: erev, label: 增程式, aliases: [增程, 增程车, EREV]}
+  # 对照维度（用户可在此基础上确认/加权重；权重不改变事实层）
+  comparison_fields: [price, fuel_consumption, energy_consumption, range, space]
+  # 官方/论坛来源域名（真实部署由管理员配置；缺省仅退回知识库，不臆造网页）
+  target_sites:
+    official: []
+    forum: []
+    web: []
+
+intent_keywords:
+  购车研究: [买车, 购车, 选车, 家用车, 车型, 轿车, SUV, 新能源车, 4S店, 提车]
+  能源: [燃油, 纯电, 插混, 增程, 新能源, 混动, 油耗, 电耗, 续航]
+
+slots:
+  - {name: budget,      type: money,    required_for: [购车研究], prompt: 预算上限是多少（如 10 万以内）？}
+  - name: energy_type
+    type: enum
+    required_for: [购车研究]
+    prompt: 想看哪种能源类型（燃油/纯电/插混/增程；不确定可回复"全部比较"）？
+    options: [icev, bev, phev, erev, all]
+  - {name: usage, type: text, required_for: [], prompt: "主要用途/偏好（如通勤、家用空间、长途）？"}
+  - name: body_type
+    type: enum
+    required_for: []
+    prompt: "偏好车型（轿车 / SUV / 不限）？"
+    options: [sedan, suv, all]
+
+# 兼容旧路径的静态模板（默认主链路走 Coordinator，不再依赖此模板）
+subtask_templates:
+  购车研究:
+    - id: car_research
+      role: researcher
+      objective: 检索候选车型官方参数与车主反馈（只读）
+      tool: kb_search
+      tool_args: {query: "{goal} 车型 参数 价格 续航 油耗"}

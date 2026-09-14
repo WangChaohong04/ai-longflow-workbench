@@ -1,13 +1,11 @@
-# SPEC §10 用例 4：来源冲突 → 标注冲突，不作为已验证结论放行
-# （SPEC §6 出口闸门"来源冲突→标注冲突不算通过"；前提：知识库含差旅住宿标准两份版本文件）
+# 知识时效：已失效版本（travel_2023，2023-12-31 失效）应在检索阶段被排除，
+# 回答采用现行有效版本（travel_2024）；过期版本与现行版本不再误报为"来源冲突"。
 id: source_conflict
-name: 差旅住宿标准来源冲突被标注
+name: 过期知识版本被排除并采用现行版本
 scenario: team_ops
-goal: "出差住宿标准是多少？两份版本不一样怎么办？"
+goal: "出差住宿标准是多少？"
 expect:
-  answer_contains: ["住宿"]
-  conflict_flagged: true          # result.conflicts 非空或答案明确标注冲突
-  verified_not_true: true         # verified 不为 true（冲突不算通过）
-  retrieval_on_demand: 2          # 单次检索即得两版本证据（冲突在召回内识别），不无限补检索
-  no_unretrieved_claim: true      # 冲突结论基于检索到的两版本，非模型推断
+  answer_contains: ["住宿", "500"]
+  conflict_flagged: false         # 过期版已排除，现行有效资料无冲突
+  verified_not_true: false        # 现行版本可核验通过
   terminal_not_pending: true

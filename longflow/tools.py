@@ -12,12 +12,23 @@ import json
 import sqlite3
 from typing import Callable
 
-from . import db, events, permissions, rag
+from . import db, events, permissions, rag, netguard
 from .plugins.sdk import ToolContext, ToolSpec  # re-export for convenience
 
 # 已知失败供应商（演示权威系统不可达场景；真实系统由插件/配置提供）
 UNREACHABLE_VENDORS = {"unreachable-vendor"}
-APPROVED_VENDORS = {"approved-vendor", "standard-it"}
+
+
+class ToolResultInDoubt(RuntimeError):
+    """副作用工具可能已执行但结果未确认（如本地不可中断工具超时）。
+
+    对应任务进入"待人工确认"，绝不自动重试，避免重复下单/重复外发。
+    """
+
+    def __init__(self, tool_name: str, reason: str):
+        self.tool_name = tool_name
+        self.reason = reason
+        super().__init__(f"工具 {tool_name} 结果待确认：{reason}")
 
 
 class ToolRegistry:
@@ -25,7 +36,20 @@ class ToolRegistry:
         self._tools: dict[str, ToolSpec] = {}
         self._meta: dict[str, dict] = {}
 
-    def register(self, spec: ToolSpec, *, data_dir: str = "", config: dict | None = None) -> None:
+    def register(self, spec: ToolSpec, *, data_dir: str = "", config: dict | None = None,
+                 on_conflict: str = "error") -> None:
+        """注册工具。重名默认报错：不静默覆盖核心工具，也不让插件顶替并自降 risk。
+
+        on_conflict="override" 时显式允许覆盖（仅核心注册/测试使用）。
+        """
+        if spec.name in self._tools and on_conflict != "override":
+            existing = self._tools[spec.name]
+            same = (getattr(existing, "description", "") == spec.description
+                    and getattr(existing, "risk", "") == spec.risk)
+            if not same:
+                raise ValueError(
+                    f"工具名冲突：{spec.name!r} 已注册（{getattr(existing, 'description', '')[:30]}），"
+                    f"拒绝静默覆盖；请改用不同工具名或显式 on_conflict='override'")
         self._tools[spec.name] = spec
         self._meta[spec.name] = {"data_dir": data_dir, "config": config or {}}
 
@@ -45,14 +69,25 @@ class ToolRegistry:
 # ---------- 核心内置工具 ----------
 
 def _tool_kb_search(args: dict, ctx: ToolContext) -> dict:
-    chunks = rag.search(
+    # 按需分段检索：首轮不足时在预算内改写/扩召回一次；逐阶段记录命中与耗时。
+    staged = rag.search_staged(
         ctx.conn,
         args["query"],
         scenario=ctx.scenario or None,
         fields=args.get("fields"),
         top_k=int(args.get("top_k", 5)),
+        max_rounds=int(args.get("max_rounds", 2)),
     )
-    return {"chunks": chunks, "count": len(chunks)}
+    try:
+        ctx.emit("retrieval", {
+            "tool": "kb_search", "query": args["query"],
+            "stages": staged["stages"], "rounds": len(staged["stages"]),
+            "total_hits": staged["count"],
+        })
+    except Exception:  # noqa: BLE001 - 观测事件失败不影响检索
+        pass
+    return {"chunks": staged["chunks"], "count": staged["count"],
+            "retrieval_stages": staged["stages"]}
 
 
 def _tool_record_note(args: dict, ctx: ToolContext) -> dict:
@@ -61,13 +96,30 @@ def _tool_record_note(args: dict, ctx: ToolContext) -> dict:
 
 def _tool_http_get(args: dict, ctx: ToolContext) -> dict:
     url = args["url"]
+    # 域名白名单：优先取工具参数 allowed_domains，其次插件/领域配置
+    allowlist = args.get("allowed_domains") or ctx.plugin_config.get("allowed_domains")
+    try:
+        netguard.check_url(url, allowlist=allowlist)
+    except netguard.UrlNotAllowed as exc:
+        # SSRF/非白名单/危险协议：拒绝，不发起请求（失败如实记录，绝不抓取）
+        return {"ok": False, "error": f"url_blocked: {exc}", "url": url, "blocked": True}
     if ctx.http is None:
-        # 无外部网络配置时如实返回，不编造内容
         return {"ok": False, "error": "http_client_unavailable", "url": url}
     try:
-        resp = ctx.http.get(url, timeout=15)
-        return {"ok": True, "status": resp.status_code, "text": resp.text[:4000]}
-    except Exception as exc:  # noqa: BLE001 - 工具失败必须如实上抛/返回
+        # follow_redirects=False：重定向目标必须逐跳重新过 SSRF/白名单校验
+        resp = ctx.http.get(url, timeout=15, follow_redirects=False)
+        if resp.status_code in (301, 302, 303, 307, 308):
+            loc = resp.headers.get("location", "")
+            nxt = loc if str(loc).startswith("http") else f"{resp.url.scheme}://{resp.url.host}{loc}"
+            try:
+                netguard.check_url(nxt, allowlist=allowlist)
+            except netguard.UrlNotAllowed as exc:
+                return {"ok": False, "error": f"redirect_blocked: {exc}", "url": url,
+                        "redirect": nxt, "blocked": True}
+            return {"ok": False, "error": "redirect_requires_recheck", "redirect": nxt,
+                    "url": url, "blocked": True}
+        return {"ok": True, "status": resp.status_code, "text": resp.text[:4000], "url": str(resp.url)}
+    except Exception as exc:  # noqa: BLE001
         return {"ok": False, "error": str(exc)[:300], "url": url}
 
 
@@ -82,15 +134,42 @@ def _tool_send_notification(args: dict, ctx: ToolContext) -> dict:
     }
 
 
+def _gather_root_chunks(ctx: ToolContext) -> list[dict]:
+    """汇总同 root 任务研究阶段检索到的知识 chunks（供执行前约束核验）。"""
+    rows = ctx.conn.execute(
+        """SELECT result_json FROM tasks WHERE root_id=?""", (ctx.root_id,)
+    ).fetchall()
+    chunks = []
+    for r in rows:
+        try:
+            res = json.loads(r["result_json"] or "{}")
+        except Exception:  # noqa: BLE001
+            continue
+        for c in res.get("chunks", []) or []:
+            if isinstance(c, dict) and c.get("text"):
+                chunks.append(c)
+    return chunks
+
+
 def _tool_make_purchase(args: dict, ctx: ToolContext) -> dict:
     """下单（high 风险，有外部副作用）。
 
-    供应商不在名录或不可达时如实失败——工具失败绝不描述为成功。
+    执行前基于研究阶段证据核验硬约束（金额审批线/供应商名录）：
+    - 证据明确标明供应商不在名录且违规 -> 拒绝下单（不借"人工审批"放行违规）。
+    - 金额达到审批线 -> 提示需审批（high 风险本身已强制逐次审批）。
+    - 供应商系统不可达 -> 如实失败。工具失败绝不描述为成功。
     """
+    from . import verification as _v
     vendor = args.get("vendor") or "approved-vendor"  # 未指定时走公司标准供应商
     if vendor in UNREACHABLE_VENDORS:
         raise RuntimeError(f"供应商系统不可达: {vendor}")
-    # 名录用于规则问答；执行层仅拦截显式标记为不可达的供应商，其余由人工审批把关。
+    # 基于已检索证据核验供应商/金额硬约束
+    chunks = _gather_root_chunks(ctx)
+    if chunks:
+        chk = _v.check_purchase_constraints(args, chunks)
+        bad_vendor = [p for p in chk["problems"] if p.get("kind") == "vendor_not_listed"]
+        if bad_vendor:
+            raise RuntimeError("采购约束核验失败：" + "；".join(p["problem"] for p in bad_vendor))
     amount = float(args.get("amount", 0))
     return {
         "ordered": True,
@@ -224,7 +303,8 @@ class ToolRuntime:
             detail={"tool": tool_name, "tool_name": tool_name, "args": args, "risk": risk, "reason": reason},
         )
         decision = permissions.decide(
-            self.conn, tool_name, risk, args, task_id=task.id
+            self.conn, tool_name, risk, args, task_id=task.id,
+            root_id=getattr(task, "root_id", task.id),
         )
         if decision.verdict == permissions.DENY:
             events.emit(
@@ -298,20 +378,44 @@ class ToolRuntime:
         plugin_config = plugin_config if plugin_config is not None else meta.get("config", {})
         ctx = self._context(task, plugin_config, plugin_data_dir)
         result: dict
+        timed_out = False
+        # 独立 executor：超时后不 shutdown(wait=True) 阻塞主流程；daemon 线程自行结束，
+        # 不拖垮整个 tick（本地不可中断工具如实标注为"可能已执行，待确认"）。
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(spec.handler, args, ctx)
-                try:
-                    result = future.result(timeout=self.timeout_seconds)
-                except concurrent.futures.TimeoutError:
-                    raise RuntimeError(f"工具执行超时（{self.timeout_seconds}s）")
-            ok = True
+            future = pool.submit(spec.handler, args, ctx)
+            try:
+                result = future.result(timeout=self.timeout_seconds)
+            except concurrent.futures.TimeoutError:
+                timed_out = True
+                result = {"error": f"工具执行超时（{self.timeout_seconds}s）"}
+            ok = not timed_out
             err = None
-            if isinstance(result, dict) and result.get("ok") is False:
+            if not timed_out and isinstance(result, dict) and result.get("ok") is False:
                 ok = False
                 err = result.get("error", "tool_returned_failure")
+            if timed_out:
+                err = result["error"]
+                if spec.side_effect:
+                    events.emit(
+                        self.conn,
+                        events.TOOL_RESULT,
+                        task_id=task.id,
+                        actor=f"tool:{tool_name}",
+                        detail={
+                            "tool": tool_name, "tool_name": tool_name,
+                            "ok": False, "error": err, "in_doubt": True,
+                            "idempotency_key": idem_key, "result": None,
+                        },
+                    )
+                    raise ToolResultInDoubt(tool_name, err)
+        except ToolResultInDoubt:
+            raise  # 副作用待确认：向上传播，不被下面的通用失败处理吞掉
         except Exception as exc:  # noqa: BLE001 - 失败如实记录
             result, ok, err = {"error": str(exc)[:500]}, False, str(exc)[:500]
+        finally:
+            # wait=False：不等待可能卡死的本地工具线程；daemon 线程随进程退出回收。
+            pool.shutdown(wait=False)
 
         if decision.grant_id:
             permissions.increment_grant(self.conn, decision.grant_id)
@@ -326,6 +430,8 @@ class ToolRuntime:
                 "tool_name": tool_name,
                 "ok": ok,
                 "error": err,
+                "args": args,
+                "blocked": bool(isinstance(result, dict) and result.get("blocked")),
                 "idempotency_key": idem_key,
                 "result": result if ok else None,
             },

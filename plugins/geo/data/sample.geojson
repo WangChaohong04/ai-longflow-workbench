@@ -1,0 +1,183 @@
+{
+  "type": "FeatureCollection",
+  "name": "longflow_geo_sample_beijing_zhongguancun",
+  "crs": {
+    "type": "name",
+    "properties": { "name": "urn:ogc:def:crs:EPSG::4326" }
+  },
+  "metadata": {
+    "description": "LongFlow GEO 插件本地样例数据：北京中关村/海淀片区兴趣点。坐标为 WGS84(EPSG:4326) 演示坐标；rating/noise_level 为演示样例值，无外部来源，对应 *_source 字段均为 null，不得作为实测事实引用。",
+    "region": "北京市海淀区中关村",
+    "crs": "EPSG:4326"
+  },
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": { "type": "Point", "coordinates": [116.3192, 39.9835] },
+      "properties": {
+        "name": "中关村地铁站",
+        "aliases": ["中关村站", "中关村"],
+        "category": "交通",
+        "address": "北京市海淀区中关村大街（地铁4号线/10号线）",
+        "rating": null,
+        "rating_source": null,
+        "noise_level": "high",
+        "noise_level_source": null
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": { "type": "Point", "coordinates": [116.3174, 39.9828] },
+      "properties": {
+        "name": "星巴克咖啡（中关村欧美汇店）",
+        "aliases": ["星巴克欧美汇", "星巴克中关村"],
+        "category": "咖啡馆",
+        "address": "北京市海淀区中关村大街欧美汇购物中心一层",
+        "rating": 4.2,
+        "rating_source": null,
+        "noise_level": "medium",
+        "noise_level_source": null
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": { "type": "Point", "coordinates": [116.3205, 39.9795] },
+      "properties": {
+        "name": "瑞幸咖啡（海淀黄庄店）",
+        "aliases": ["瑞幸海淀黄庄", "luckin黄庄"],
+        "category": "咖啡馆",
+        "address": "北京市海淀区海淀大街海淀黄庄附近",
+        "rating": 4.4,
+        "rating_source": null,
+        "noise_level": "medium",
+        "noise_level_source": null
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": { "type": "Point", "coordinates": [116.3125, 39.9838] },
+      "properties": {
+        "name": "Manner Coffee（中关村店）",
+        "aliases": ["Manner中关村", "manner咖啡中关村"],
+        "category": "咖啡馆",
+        "address": "北京市海淀区中关村南路附近",
+        "rating": 4.5,
+        "rating_source": null,
+        "noise_level": "medium",
+        "noise_level_source": null
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": { "type": "Point", "coordinates": [116.3098, 39.9815] },
+      "properties": {
+        "name": "车库咖啡（中关村创业大街店）",
+        "aliases": ["车库咖啡", "创业大街车库咖啡"],
+        "category": "咖啡馆",
+        "address": "北京市海淀区中关村创业大街",
+        "rating": 4.0,
+        "rating_source": null,
+        "noise_level": "high",
+        "noise_level_source": null
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": { "type": "Point", "coordinates": [116.3155, 39.9860] },
+      "properties": {
+        "name": "纳什空间（中关村联合办公）",
+        "aliases": ["纳什空间中关村", "nash中关村"],
+        "category": "共享办公",
+        "address": "北京市海淀区中关村大街甲附近",
+        "rating": 4.3,
+        "rating_source": null,
+        "noise_level": "low",
+        "noise_level_source": null
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": { "type": "Point", "coordinates": [116.3110, 39.9790] },
+      "properties": {
+        "name": "优客工场（中关村智造大街社区）",
+        "aliases": ["优客工场中关村", "ucommune中关村"],
+        "category": "共享办公",
+        "address": "北京市海淀区中关村智造大街",
+        "rating": 4.1,
+        "rating_source": null,
+        "noise_level": "medium",
+        "noise_level_source": null
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": { "type": "Point", "coordinates": [116.3225, 39.9810] },
+      "properties": {
+        "name": "WeWork（海淀黄庄社区）",
+        "aliases": ["wework黄庄", "WeWork海淀"],
+        "category": "共享办公",
+        "address": "北京市海淀区海淀大街与知春路交汇附近",
+        "rating": 4.6,
+        "rating_source": null,
+        "noise_level": "low",
+        "noise_level_source": null
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": { "type": "Point", "coordinates": [116.3150, 39.9835] },
+      "properties": {
+        "name": "中关村图书大厦",
+        "aliases": ["图书大厦", "中关村书店"],
+        "category": "图书馆",
+        "address": "北京市海淀区中关村大街",
+        "rating": 4.5,
+        "rating_source": null,
+        "noise_level": "low",
+        "noise_level_source": null
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": { "type": "Point", "coordinates": [116.3180, 39.9905] },
+      "properties": {
+        "name": "北京大学图书馆",
+        "aliases": ["北大图书馆", "北京大学东门图书馆"],
+        "category": "图书馆",
+        "address": "北京市海淀区颐和园路5号北京大学校内（近东门）",
+        "rating": 4.8,
+        "rating_source": null,
+        "noise_level": "low",
+        "noise_level_source": null
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": { "type": "Point", "coordinates": [116.3065, 39.9845] },
+      "properties": {
+        "name": "海淀区图书馆（中关村分馆）",
+        "aliases": ["海淀图书馆中关村", "海淀区图书馆"],
+        "category": "图书馆",
+        "address": "北京市海淀区苏州街附近",
+        "rating": 4.4,
+        "rating_source": null,
+        "noise_level": "low",
+        "noise_level_source": null
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": { "type": "Point", "coordinates": [116.3168, 39.9842] },
+      "properties": {
+        "name": "麦当劳（中关村广场餐厅）",
+        "aliases": ["麦当劳中关村", "金拱门中关村"],
+        "category": "餐饮",
+        "address": "北京市海淀区中关村广场步行街",
+        "rating": 3.9,
+        "rating_source": null,
+        "noise_level": "high",
+        "noise_level_source": null
+      }
+    }
+  ]
+}

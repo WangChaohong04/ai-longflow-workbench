@@ -13,7 +13,11 @@ import json
 import re
 from typing import Any
 
+import time as _time
+
 import httpx
+
+from . import redaction as _redact
 
 ACTION_TOOL_CALL = "tool_call"
 ACTION_ANSWER = "answer"
@@ -257,39 +261,116 @@ class LocalDriver(BaseDriver):
 class OpenAICompatibleDriver(BaseDriver):
     name = "openai_compatible"
 
-    def __init__(self, base_url: str, model: str, api_key: str, timeout: float = 60.0):
+    def __init__(self, base_url: str, model: str, api_key: str, timeout: float = 60.0,
+                 strict: bool = False, max_retries: int = 1):
+        from urllib.parse import urlsplit
+        endpoint = urlsplit(base_url or "")
+        if endpoint.scheme not in ("http", "https") or not endpoint.hostname:
+            raise LLMError("LLM_BASE_URL 必须是有效的 http(s) API 地址")
+        if endpoint.username or endpoint.password or endpoint.query or endpoint.fragment:
+            raise LLMError("LLM_BASE_URL 不允许包含凭据、查询参数或片段")
+        if not isinstance(model, str) or not model.strip():
+            raise LLMError("LLM_MODEL 未配置")
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
         self.timeout = timeout
+        self.strict = strict              # True 时禁止自动降级到本地规则
+        self.max_retries = max(0, int(max_retries))
         self._fallback = LocalDriver()
+        self.reports: list[dict] = []     # 每次真实 HTTP 调用的可观察记录（由编排层抽取）
         if not api_key:
             raise LLMError("LLM_API_KEY 未配置")
 
-    def _chat_json(self, system: str, user: str) -> dict:
-        try:
-            resp = httpx.post(
-                f"{self.base_url}/chat/completions",
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                json={
-                    "model": self.model,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    "temperature": 0.2,
-                    "response_format": {"type": "json_object"},
-                },
-                timeout=self.timeout,
-            )
-            resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"]
-            return json.loads(content)
-        except Exception as exc:  # noqa: BLE001
-            raise LLMError(f"LLM 调用失败: {str(exc)[:200]}") from exc
+    def drain_reports(self) -> list[dict]:
+        out = self.reports
+        self.reports = []
+        return out
+
+    @staticmethod
+    def _redact_payload(obj):
+        """发送给模型前对载荷脱敏（不破坏结构，仅遮蔽 key/secret/token/手机号/邮箱等）。"""
+        return _redact.redact_obj(obj)
+
+    def _chat_json(self, system: str, user: str, call_type: str = "chat") -> dict:
+        # 预算化重试：仅对可恢复错误（网络/超时/限流/5xx/JSON 解析失败）重试；
+        # 鉴权(401/403)与缺 key 不重试。每次尝试都落一条调用记录。
+        payload = self._redact_payload({
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": 0.2,
+            "response_format": {"type": "json_object"},
+        })
+        last_err = None
+        for attempt in range(self.max_retries + 1):
+            t0 = _time.monotonic()
+            rec = {"driver": self.name, "model": self.model, "call_type": call_type,
+                   "attempt": attempt + 1, "ok": False, "latency_ms": None,
+                   "prompt_tokens": None, "completion_tokens": None, "fallback": False,
+                   "error": None}
+            retryable = False
+            try:
+                resp = httpx.post(
+                    f"{self.base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    json=payload,
+                    timeout=self.timeout,
+                )
+                rec["latency_ms"] = int((_time.monotonic() - t0) * 1000)
+                rec["http_status"] = resp.status_code
+                if resp.status_code in (401, 403):
+                    raise LLMError(f"LLM 鉴权失败({resp.status_code})：检查 API Key")
+                if resp.status_code == 429 or resp.status_code >= 500:
+                    retryable = True
+                    raise LLMError(f"LLM 服务暂不可用({resp.status_code})")
+                resp.raise_for_status()
+                data = resp.json()
+                usage = data.get("usage") or {}
+                rec["prompt_tokens"] = usage.get("prompt_tokens", usage.get("input_tokens"))
+                rec["completion_tokens"] = usage.get("completion_tokens", usage.get("output_tokens"))
+                content = data["choices"][0]["message"]["content"]
+                parsed = json.loads(content)  # JSON 解析失败 => 可恢复，可重试
+                if not isinstance(parsed, dict):
+                    raise ValueError("模型必须返回 JSON 对象")
+                rec["ok"] = True
+                self.reports.append(rec)
+                return parsed
+            except LLMError as exc:
+                last_err = exc
+                rec["error"] = str(exc)[:200]
+            except (json.JSONDecodeError, KeyError, IndexError) as exc:
+                # 结构/JSON 可恢复错误
+                retryable = True
+                last_err = LLMError(f"LLM 返回结构异常: {str(exc)[:120]}")
+                rec["error"] = str(last_err)[:200]
+                rec["latency_ms"] = rec["latency_ms"] or int((_time.monotonic() - t0) * 1000)
+            except Exception as exc:  # noqa: BLE001 - 网络/超时
+                retryable = True
+                last_err = LLMError(f"LLM 调用失败: {str(exc)[:200]}")
+                rec["error"] = str(last_err)[:200]
+                rec["latency_ms"] = rec["latency_ms"] or int((_time.monotonic() - t0) * 1000)
+            self.reports.append(rec)
+            if not retryable or attempt >= self.max_retries:
+                break
+        raise last_err or LLMError("LLM 调用失败")
+
+    def _fallback_or_raise(self, kind: str, exc: Exception, fn, *args):
+        if self.strict:
+            raise LLMError(f"[strict] 模型调用失败且禁止降级：{str(exc)[:150]}") from exc
+        # 记录一次"降级"事实（真实模型失败、改用本地规则）。
+        self.reports.append({
+            "driver": self.name, "model": self.model, "call_type": kind,
+            "attempt": 0, "ok": False, "latency_ms": None,
+            "prompt_tokens": None, "completion_tokens": None, "fallback": True,
+            "error": f"降级到本地规则驱动: {str(exc)[:150]}",
+        })
+        return fn(*args)
 
     def plan(self, goal, scenario_cfg, slots):
-        # 计划结构复杂且必须稳定：始终用本地确定性规划，模型用于子任务推理/起草
+        # 计划结构复杂且必须稳定：始终用本地确定性规划（非模型调用，不产生 report）。
         return self._fallback.plan(goal, scenario_cfg, slots)
 
     def next_action(self, task, ctx):
@@ -298,19 +379,26 @@ class OpenAICompatibleDriver(BaseDriver):
             "\"tool\":...,\"args\":{...},\"reason\":...}。工具权限由系统控制，不要声称已执行。"
         )
         user = json.dumps(
-            {"task": task.objective, "role": task.agent_role, "slots": task.slots,
-             "available_tools": ctx.get("tool_specs", ctx.get("available_tools", [])),
-             "tool_hint": ctx.get("tool_hint"), "goal": ctx.get("goal"),
-             "evidence": ctx.get("evidence", {})},
+            self._redact_payload(
+                {"task": task.objective, "role": task.agent_role, "slots": task.slots,
+                 "available_tools": ctx.get("tool_specs", ctx.get("available_tools", [])),
+                 "tool_hint": ctx.get("tool_hint"), "goal": ctx.get("goal"),
+                 "evidence": ctx.get("evidence", {})}),
             ensure_ascii=False,
         )
         try:
-            out = self._chat_json(system, user)
-            if out.get("type") in (ACTION_TOOL_CALL, ACTION_ANSWER):
+            out = self._chat_json(system, user, call_type="next_action")
+            # 结构校验：类型合法；tool_call 必须带已知工具名与 dict 参数
+            if out.get("type") == ACTION_TOOL_CALL:
+                if not out.get("tool") or not isinstance(out.get("args", {}), dict):
+                    raise LLMError("next_action 缺少 tool 或 args 结构非法")
                 return out
-        except LLMError:
-            pass
-        return self._fallback.next_action(task, ctx)
+            if out.get("type") == ACTION_ANSWER:
+                return out
+            raise LLMError(f"next_action 返回未知类型: {out.get('type')!r}")
+        except LLMError as exc:
+            return self._fallback_or_raise("next_action", exc,
+                                           self._fallback.next_action, task, ctx)
 
     def draft_answer(self, question, chunks, slots):
         if not chunks:
@@ -320,30 +408,46 @@ class OpenAICompatibleDriver(BaseDriver):
             "资料不足就明确说无法确认，不得编造。只输出 JSON：{\"text\":...,\"citations\":[...]}。"
         )
         user = json.dumps(
-            {"question": question,
-             "sources": [{"chunk_id": c["chunk_id"], "text": c["text"],
-                          "doc": c["doc_name"], "citations": c.get("citations", [])} for c in chunks]},
+            self._redact_payload(
+                {"question": question,
+                 "sources": [{"chunk_id": c["chunk_id"], "text": c["text"],
+                              "doc": c["doc_name"], "citations": c.get("citations", [])}
+                             for c in chunks]}),
             ensure_ascii=False,
         )
         try:
-            out = self._chat_json(system, user)
-            out.setdefault("citations", [c["chunk_id"] for c in chunks[:3]])
-            out["no_evidence"] = False
+            out = self._chat_json(system, user, call_type="draft_answer")
+            # 不自动补引用：模型漏写 citations 保持为空，由核验闸门判"证据不足"。
+            if not isinstance(out.get("citations"), list):
+                out["citations"] = []
+            valid = {c["chunk_id"] for c in chunks}
+            out["citations"] = [cid for cid in out["citations"] if cid in valid]
+            if not isinstance(out.get("text"), str):
+                raise LLMError("draft_answer 返回缺少 text 字段")
+            out["no_evidence"] = len(out["citations"]) == 0
             return out
-        except LLMError:
-            return self._fallback.draft_answer(question, chunks, slots)
+        except LLMError as exc:
+            return self._fallback_or_raise("draft_answer", exc,
+                                           self._fallback.draft_answer, question, chunks, slots)
 
 
 def build_driver(cfg: dict) -> BaseDriver:
     llm_cfg = cfg.get("llm", {})
     driver = llm_cfg.get("driver", "local")
     if driver == "openai_compatible":
+        strict = bool(llm_cfg.get("strict", False))
         try:
             return OpenAICompatibleDriver(
                 llm_cfg.get("base_url", ""),
                 llm_cfg.get("model", ""),
                 llm_cfg.get("api_key", ""),
+                timeout=float(llm_cfg.get("timeout_seconds", 60)),
+                strict=strict,
+                max_retries=int(llm_cfg.get("max_retries", 1)),
             )
         except LLMError:
+            if strict:
+                # 严格模式下缺 key/配置错误：显式失败，不静默降级
+                raise
             return LocalDriver()
     return LocalDriver()

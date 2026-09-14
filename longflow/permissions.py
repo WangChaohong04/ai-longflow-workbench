@@ -87,6 +87,7 @@ def decide(
     args: dict,
     *,
     task_id: str | None = None,
+    root_id: str | None = None,
 ) -> Decision:
     obj_id = _object_id(tool_name, args)
 
@@ -104,11 +105,19 @@ def decide(
 
     # 2) high：只接受与本次动作参数完全一致的一次性批准
     if risk == "high":
-        approved = conn.execute(
-            """SELECT * FROM approvals WHERE tool_name=? AND status='approved'
-               AND args_hash=?""",
-            (tool_name, args_hash(tool_name, args)),
-        ).fetchone()
+        if root_id:
+            approved = conn.execute(
+                """SELECT a.* FROM approvals a JOIN tasks t ON t.id=a.task_id
+                   WHERE a.tool_name=? AND a.status='approved' AND a.args_hash=?
+                     AND t.root_id=?""",
+                (tool_name, args_hash(tool_name, args), root_id),
+            ).fetchone()
+        else:
+            approved = conn.execute(
+                """SELECT * FROM approvals WHERE tool_name=? AND status='approved'
+                   AND args_hash=?""",
+                (tool_name, args_hash(tool_name, args)),
+            ).fetchone()
         if approved:
             return Decision(ALLOW, "已获逐次审批（参数绑定一致）")
         return Decision(NEEDS_APPROVAL, "高风险动作需要逐次人工审批")
@@ -117,10 +126,18 @@ def decide(
     for g in grants:
         if g["scope"] == "preauth" and _grant_matches(g, tool_name, obj_id):
             return Decision(ALLOW, f"预授权范围内（剩余 {_remaining(g)} 次）", g["id"])
-    approved = conn.execute(
-        "SELECT * FROM approvals WHERE tool_name=? AND status='approved' AND args_hash=?",
-        (tool_name, args_hash(tool_name, args)),
-    ).fetchone()
+    if root_id:
+        approved = conn.execute(
+            """SELECT a.* FROM approvals a JOIN tasks t ON t.id=a.task_id
+               WHERE a.tool_name=? AND a.status='approved' AND a.args_hash=?
+                 AND t.root_id=?""",
+            (tool_name, args_hash(tool_name, args), root_id),
+        ).fetchone()
+    else:
+        approved = conn.execute(
+            "SELECT * FROM approvals WHERE tool_name=? AND status='approved' AND args_hash=?",
+            (tool_name, args_hash(tool_name, args)),
+        ).fetchone()
     if approved:
         return Decision(ALLOW, "已获逐次审批")
     return Decision(NEEDS_APPROVAL, "中风险动作超出预授权范围，需要审批")

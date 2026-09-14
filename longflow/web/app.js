@@ -2,6 +2,7 @@
  * 仅通过 fetch 调用 /api/*；所有渲染均做防御式取值。 */
 import { getActiveMapPluginId, listMapPlugins, setActiveMapPlugin, getManualMapPlugin } from "./maps/index.js";
 import { createMapController } from "./maps/panel.js";
+import { showCapabilities, showKnowledgePreview, resultActions } from "./workflow.js";
 
 // ============================== 全局状态 ==============================
 const state = {
@@ -12,10 +13,11 @@ const state = {
   pollInFlight: false,
   healthTimer: null,
   clarificationDrafts: new Map(),
+  geoTabs: new Map(),  // GEO 卡片地图/地点 tab 选择，跨轮询保留
   mapPanels: new Map(),  // geoKey -> 地图面板缓存（plugin/host/模式/选中点/路线方式）
 };
 
-const TERMINAL_STATUS = new Set(["completed", "failed", "cancelled"]);
+const TERMINAL_STATUS = new Set(["completed", "partially_completed", "failed", "cancelled"]);
 
 // ============================== 中文映射 ==============================
 const STATUS_LABELS = {
@@ -24,6 +26,10 @@ const STATUS_LABELS = {
   in_progress: "进行中",
   waiting_approval: "待审批",
   waiting_event: "等待中",
+  waiting_user: "待用户处理",
+  waiting_external: "等待外部",
+  retrying: "重试中",
+  partially_completed: "部分完成",
   completed: "已完成",
   failed: "失败",
   cancelled: "已取消",
@@ -34,6 +40,10 @@ const STATUS_BADGE = {
   in_progress: "accent pulse",
   waiting_approval: "warn pulse",
   waiting_event: "warn pulse",
+  waiting_user: "warn pulse",
+  waiting_external: "warn pulse",
+  retrying: "accent pulse",
+  partially_completed: "warn",
   completed: "ok",
   failed: "danger",
   cancelled: "",
@@ -44,6 +54,22 @@ const ROLE_LABELS = {
   executor: "执行",
   verifier: "核验",
 };
+function roleLabel(role) {
+  if (!role) return "节点";
+  if (ROLE_LABELS[role]) return ROLE_LABELS[role];
+  if (role.startsWith("subagent:")) {
+    const map = {
+      web_researcher: "网页检索", official_source_researcher: "官方资料",
+      forum_researcher: "论坛观点", file_researcher: "文件检索",
+      rag_researcher: "知识库检索", geo_researcher: "地理分析",
+      normalizer: "标准化", evidence_verifier: "证据核验",
+      comparison_agent: "事实对照",
+    };
+    const id = role.slice("subagent:".length);
+    return map[id] || id;
+  }
+  return role;
+}
 const EVENT_LABELS = {
   task_created: "任务创建",
   task_status: "状态变更",
@@ -58,6 +84,7 @@ const EVENT_LABELS = {
   llm_call: "模型调用",
   error: "错误",
   recovery: "恢复",
+  clarify: "需要澄清",
 };
 const ERROR_CODE_HINTS = {
   permission_denied: "该操作因权限不足被阻止（越权拦截）。",
@@ -127,7 +154,6 @@ function parseJson(maybe, fallback) {
 
 function asArray(v) { return Array.isArray(v) ? v : []; }
 
-function roleLabel(role) { return ROLE_LABELS[role] || role || "—"; }
 
 // ============================== API 封装 ==============================
 class ApiError extends Error {
@@ -139,24 +165,40 @@ class ApiError extends Error {
   }
 }
 
+// 可选鉴权头（本地单用户模式无需配置；启用 token 时在浏览器控制台
+// localStorage.setItem("longflow.token","...") / setItem("longflow.workspace","...")）。
+function authHeaders() {
+  const h = {};
+  try {
+    const tok = localStorage.getItem("longflow.token");
+    const ws = localStorage.getItem("longflow.workspace");
+    if (tok) h.Authorization = `Bearer ${tok}`;
+    if (ws) h["X-Workspace"] = ws;
+  } catch { /* 无 localStorage 时忽略 */ }
+  return h;
+}
+
 async function api(path, options = {}) {
   let resp;
   try {
-    resp = await fetch(path, {
-      headers: options.body ? { "Content-Type": "application/json" } : undefined,
-      ...options,
-    });
+    const isForm = typeof FormData !== "undefined" && options.body instanceof FormData;
+    const headers = { ...authHeaders(), ...(options.headers || {}) };
+    if (options.body && !isForm) headers["Content-Type"] = "application/json";
+    // FormData 不手设 Content-Type，交给浏览器自动加 multipart boundary
+    resp = await fetch(path, { ...options, headers });
   } catch (e) {
     throw new ApiError("无法连接后端服务（网络错误或服务未启动）。", "network", 0);
   }
   let data = null;
   const text = await resp.text();
+  if (resp.ok && options.responseFormat === "text") return text;
   if (text) {
     try { data = JSON.parse(text); } catch { data = { raw: text }; }
   }
   if (!resp.ok) {
-    const code = (data && data.code) || `http_${resp.status}`;
-    const msg = (data && data.error) || `请求失败（HTTP ${resp.status}）`;
+    const problem = data?.detail && typeof data.detail === "object" ? data.detail : data;
+    const code = problem?.code || `http_${resp.status}`;
+    const msg = problem?.error || `请求失败（HTTP ${resp.status}）`;
     throw new ApiError(msg, code, resp.status, data);
   }
   return data;
@@ -205,6 +247,7 @@ function setView(view, opts = {}) {
   stopPolling();
   state.view = view;
   state.detailId = opts.detailId || null;
+  history.replaceState(null, "", view === "detail" ? `#task/${encodeURIComponent(state.detailId)}` : `#${view}`);
   document.querySelectorAll(".tab").forEach((t) => {
     const v = t.dataset.view;
     t.classList.toggle("active", v === view || (view === "detail" && v === "tasks"));
@@ -219,7 +262,191 @@ function render() {
   else if (state.view === "new") renderNewTask(app);
   else if (state.view === "detail") renderDetail(app);
   else if (state.view === "plugins") renderPlugins(app);
+  else if (state.view === "knowledge") renderKnowledge(app);
+  else if (state.view === "evolve") renderEvolve(app);
   else if (state.view === "eval") renderEval(app);
+}
+
+// ============================== 受控自进化（管理员） ==============================
+const IMPR_STATUS = {
+  proposed: "候选（未生效）", evaluated: "已评测", approved: "已审核",
+  rolled_out: "灰度启用", rejected: "已拒绝", rolled_back: "已回滚",
+};
+
+async function renderEvolve(app) {
+  app.appendChild(el("div", { class: "page-head" },
+    el("h1", {}, "受控自进化"),
+    el("span", { class: "sub" }, "系统只自动登记候选改进（proposed）；必须经独立评测 → 人工审核 → 灰度，可随时回滚。系统不会自动改代码/Prompt/权限。")));
+  const card = el("div", { class: "card" });
+  app.appendChild(card);
+  const holder = el("div", {});
+  card.appendChild(holder);
+
+  async function load() {
+    holder.innerHTML = "";
+    holder.appendChild(el("div", { class: "loading" }, "加载中…（需管理员）"));
+    let items;
+    try {
+      items = (await api("/api/improvements")).improvements || [];
+    } catch (e) {
+      holder.innerHTML = "";
+      holder.appendChild(el("div", { class: "empty" },
+        el("div", { class: "big" }, "无权访问或加载失败"),
+        el("div", {}, errorHint(e))));
+      return;
+    }
+    holder.innerHTML = "";
+    if (!items.length) { holder.appendChild(el("div", { class: "empty" }, "暂无候选改进。")); return; }
+    for (const it of items) {
+      const acts = el("div", { class: "row-gap", style: "margin-top:6px" });
+      const btn = (label, path, cls = "") => {
+        const b = el("button", { type: "button", class: `btn sm ${cls}` }, label);
+        b.addEventListener("click", async () => {
+          b.disabled = true;
+          try {
+            if (path === "evaluate") {
+              const raw = prompt('粘贴实际评测记录 JSON（含结果、测试命令、报告路径）。此操作只登记记录，不执行测试。');
+              if (raw === null) { b.disabled = false; return; }
+              const record = JSON.parse(raw);
+              if (!record || Array.isArray(record) || typeof record !== "object" || !record.command || !record.report) {
+                throw new Error("请提供实际测试 command 和 report，不能直接登记默认通过。");
+              }
+              await api(`/api/improvements/${encodeURIComponent(it.id)}/evaluate`,
+                { method: "POST", body: JSON.stringify({ eval_result: { ...record, provenance: "manual_record" } }) });
+            } else {
+              await api(`/api/improvements/${encodeURIComponent(it.id)}/${path}`, { method: "POST" });
+            }
+            toast("操作成功", "success", label);
+            load();
+          } catch (e) { toast(errorHint(e), "error", "操作失败"); b.disabled = false; }
+        });
+        return b;
+      };
+      if (it.status === "proposed") acts.appendChild(btn("登记评测结果", "evaluate"));
+      if (it.status === "evaluated") acts.appendChild(btn("人工审核通过", "approve", "primary"));
+      if (it.status === "approved") acts.appendChild(btn("登记灰度状态（不修改运行配置）", "rollout", "primary"));
+      if (it.status === "rolled_out") acts.appendChild(btn("登记回滚状态", "rollback", "danger"));
+
+      holder.appendChild(el("div", { class: "task-item", style: "display:block;margin-bottom:10px" },
+        el("div", { class: "row-gap", style: "justify-content:space-between" },
+          el("strong", {}, `${it.kind} → ${it.target || ""}`),
+          badge(IMPR_STATUS[it.status] || it.status,
+            it.status === "rolled_out" ? "ok" : (it.status === "rolled_back" || it.status === "rejected" ? "danger" : "warn"))),
+        el("div", { class: "muted", style: "font-size:12.5px;margin-top:4px" },
+          `归因：${it.attribution || "—"} · ${it.rationale || ""}`),
+        acts));
+    }
+  }
+  load();
+}
+
+// ============================== 知识（文件导入/激活） ==============================
+const DOC_STATUS_LABELS = { preview: "待确认", active: "已激活", archived: "已归档旧版" };
+
+async function renderKnowledge(app) {
+  app.appendChild(el("div", { class: "page-head" },
+    el("h1", {}, "知识文件"),
+    el("span", { class: "sub" }, "上传 txt/md/json/docx/pdf：先解析预览，确认后才激活入库并参与检索；同名旧版自动归档。")));
+
+  const card = el("div", { class: "card" });
+  const domainInput = el("input", { type: "text", value: "team_ops", placeholder: "领域，如 team_ops / geo / car_research", style: "max-width:260px" });
+  const versionInput = el("input", { type: "text", placeholder: "版本（可选，如 v2）", style: "max-width:160px" });
+  const fileInput = el("input", { type: "file", accept: ".txt,.md,.json,.docx,.pdf" });
+  const uploadBtn = el("button", { type: "button", class: "btn primary" }, "上传并预览");
+  card.appendChild(el("div", { class: "form-row" },
+    el("label", {}, "领域 domain"), domainInput,
+    el("label", { style: "margin-top:8px" }, "版本（可选）"), versionInput,
+    el("label", { style: "margin-top:8px" }, "选择文件"), fileInput,
+    el("div", { class: "row-gap", style: "margin-top:10px" }, uploadBtn)));
+
+  const listHolder = el("div", { style: "margin-top:16px" });
+  const previewHolder = el("div", { class: "card", "data-knowledge-preview": "" });
+  card.appendChild(listHolder);
+  app.appendChild(card);
+
+  const paste = el("textarea", { "aria-label": "知识文字", placeholder: "直接粘贴要导入的知识文字" });
+  const pasteButton = el("button", { type: "button", class: "btn", onClick: async () => {
+    if (!paste.value.trim()) { toast("请先输入知识文字。", "warn"); return; }
+    pasteButton.disabled = true;
+    try {
+      const doc = await api("/api/knowledge/import", { method: "POST", body: JSON.stringify({
+        filename: "粘贴知识.md", content: paste.value, domain: domainInput.value.trim() || "team_ops", version: versionInput.value.trim() }) });
+      await refreshList();
+      await showKnowledgePreview(previewHolder, doc.doc_id, { api, el });
+      toast("已生成预览，确认后激活。", "success");
+    } catch (e) { toast(`导入失败：${errorHint(e)}`, "error"); }
+    finally { pasteButton.disabled = false; }
+  } }, "导入文字并预览");
+  app.appendChild(el("details", { class: "card" }, el("summary", {}, "直接输入知识文字"), paste, pasteButton));
+  app.appendChild(previewHolder);
+
+  async function refreshList() {
+    listHolder.innerHTML = "";
+    listHolder.appendChild(el("div", { class: "loading" }, "加载中…"));
+    try {
+      const data = await api("/api/knowledge/docs");
+      const docs = (data && data.docs) || [];
+      listHolder.innerHTML = "";
+      if (!docs.length) {
+        listHolder.appendChild(el("div", { class: "empty" }, "暂无导入文档。"));
+        return;
+      }
+      const ul = el("div", {});
+      for (const d of docs) {
+        const st = d.status;
+        const row = el("div", { class: "task-item", style: "display:block;margin-bottom:8px" },
+          el("div", { class: "row-gap", style: "justify-content:space-between" },
+            el("strong", {}, d.title || d.filename),
+            badge(DOC_STATUS_LABELS[st] || st, st === "active" ? "ok" : (st === "preview" ? "warn" : ""))),
+          el("div", { class: "muted", style: "font-size:12.5px;margin-top:4px" },
+            `领域 ${d.domain} · 版本 ${d.version || "—"} · 上传者 ${d.owner || "—"} · 文件 ${d.filename}`));
+        if (st === "preview") {
+          const actBtn = el("button", { type: "button", class: "btn sm primary", style: "margin-top:6px" }, "确认激活");
+          actBtn.addEventListener("click", async () => {
+            actBtn.disabled = true;
+            try {
+              await api(`/api/knowledge/docs/${encodeURIComponent(d.id)}/activate`,
+                        { method: "POST", body: "{}" });
+              toast("已激活，开始参与检索。", "success", "已激活");
+              refreshList();
+            } catch (e) { toast(errorHint(e), "error", "激活失败"); actBtn.disabled = false; }
+          });
+          row.appendChild(actBtn);
+        }
+        row.appendChild(el("button", { type: "button", class: "btn sm", onClick: () =>
+          showKnowledgePreview(previewHolder, d.id, { api, el }) }, "查看正文与试检索"));
+        ul.appendChild(row);
+      }
+      listHolder.appendChild(ul);
+    } catch (e) {
+      listHolder.innerHTML = "";
+      listHolder.appendChild(el("div", { class: "empty" }, errorHint(e)));
+    }
+  }
+
+  uploadBtn.addEventListener("click", async () => {
+    const f = fileInput.files && fileInput.files[0];
+    if (!f) { toast("请先选择文件。", "warn", "未选择文件"); return; }
+    const fd = new FormData();
+    fd.append("file", f, f.name);
+    fd.append("domain", domainInput.value.trim() || "team_ops");
+    if (versionInput.value.trim()) fd.append("version", versionInput.value.trim());
+    uploadBtn.disabled = true; uploadBtn.textContent = "上传中…";
+    try {
+      // 用 FormData：浏览器自动设置 multipart boundary
+      const res = await api("/api/knowledge/upload", { method: "POST", body: fd });
+      toast(`解析完成：${res.section_count} 段，请确认激活。`, "success", "已预览");
+      fileInput.value = "";
+      refreshList();
+      await showKnowledgePreview(previewHolder, res.doc_id, { api, el });
+    } catch (e) {
+      toast(errorHint(e), "error", "上传失败（docx/pdf 可能缺少解析库）");
+    } finally {
+      uploadBtn.disabled = false; uploadBtn.textContent = "上传并预览";
+    }
+  });
+
+  refreshList();
 }
 
 // ============================== 任务列表 ==============================
@@ -296,10 +523,14 @@ async function renderNewTask(app) {
 
   const head = el("div", { class: "page-head" },
     el("h1", {}, "新建任务"),
-    el("span", { class: "sub" }, "写下目标，选择场景；系统会自动拆解、执行并把结果核验给你看。"));
+    el("span", { class: "sub" }, "只需写下目标：总路由会自动识别领域、风险与待补充信息，再激活对应领域主 Agent。"));
   app.appendChild(head);
 
-  const goalInput = el("textarea", { id: "f-goal", placeholder: "例如：帮我采购 2 台笔记本电脑，预算 12000 元以内；或：查一下公司采购审批规则" });
+  const goalInput = el("textarea", { id: "f-goal",
+    placeholder: "例如：10万以内家用车推荐；出差住宿标准是多少；望京5公里内找适合办公的场地" });
+  // 默认自动路由（不要求手选场景）；场景仅作为兼容/高级选项
+  const autoRoute = el("input", { type: "checkbox", checked: true,
+    style: "width:auto;margin-right:6px" });
   const scenarioSelect = el("select", { id: "f-scenario" });
   for (const s of scenarios) {
     scenarioSelect.appendChild(el("option", { value: s.name }, `${s.name} — ${s.description || ""}`));
@@ -356,7 +587,13 @@ async function renderNewTask(app) {
       submitBtn.disabled = true;
       submitBtn.textContent = "提交中…";
       try {
-        const body = { goal, scenario: scenarioSelect.value || undefined, slots: Object.keys(slots).length ? slots : undefined };
+        const useAuto = autoRoute.checked;
+        const body = {
+          goal,
+          auto_route: useAuto,
+          scenario: useAuto ? undefined : (scenarioSelect.value || undefined),
+          slots: Object.keys(slots).length ? slots : undefined,
+        };
         const res = await api("/api/tasks", { method: "POST", body: JSON.stringify(body) });
         const newId = res && (res.id || res.task_id || (res.task && res.task.id));
         toast("任务已创建，系统开始处理。", "success", "已提交");
@@ -372,17 +609,26 @@ async function renderNewTask(app) {
     el("div", { class: "card" },
       el("div", { class: "form-row" },
         el("label", {}, "任务目标", el("span", { class: "req" }, "*")),
-        goalInput),
-      el("div", { class: "form-row" },
-        el("label", {}, "场景", el("span", { class: "help" }, "不同场景有不同的知识、工具与规则")),
-        scenarioSelect),
-      el("div", { class: "form-row" },
-        el("label", {}, "补充信息（槽位，可选）",
-          el("span", { class: "help" }, "把已知信息填上可减少来回追问；标 * 为某些意图的必填项")),
-        slotBox,
-        el("div", { style: "margin-top:8px" },
-          el("button", { type: "button", class: "btn sm", onClick: () => addSlotRow() }, "＋ 添加一项")),
-        presetHolder),
+        goalInput,
+        el("span", { class: "help", style: "margin-top:6px" },
+          "回车提交即可。系统会自动识别领域（团队事务 / 选址 / 汽车研究），缺关键信息会先向你确认。")),
+      el("details", { class: "advanced", style: "margin-top:10px" },
+        el("summary", { style: "cursor:pointer;color:var(--accent,#3b82f6);font-size:13px" },
+          "高级 / 兼容选项（手动指定场景）"),
+        el("div", { class: "form-row", style: "margin-top:8px" },
+          el("label", { class: "row-gap", style: "font-weight:normal" }, autoRoute,
+            "自动识别领域（推荐）"),
+          el("span", { class: "help" }, "取消勾选后使用下方固定场景（旧兼容路径）")),
+        el("div", { class: "form-row" },
+          el("label", {}, "固定场景", el("span", { class: "help" }, "不同场景有不同的知识、工具与规则")),
+          scenarioSelect),
+        el("div", { class: "form-row" },
+          el("label", {}, "补充信息（槽位，可选）",
+            el("span", { class: "help" }, "把已知信息填上可减少来回追问；标 * 为某些意图的必填项")),
+          slotBox,
+          el("div", { style: "margin-top:8px" },
+            el("button", { type: "button", class: "btn sm", onClick: () => addSlotRow() }, "＋ 添加一项")),
+          presetHolder)),
       el("div", { class: "row-gap", style: "margin-top:6px" },
         submitBtn,
         el("button", { type: "button", class: "btn", onClick: () => setView("tasks") }, "返回列表"))));
@@ -410,6 +656,7 @@ function normalizeScenarios(cfg) {
 
 // ============================== 任务详情 ==============================
 async function renderDetail(app, silent = false) {
+  const requestedId = state.detailId;
   if (!silent) app.appendChild(el("p", { class: "loading" }, "加载详情中…"));
   let detail;
   try {
@@ -427,10 +674,17 @@ async function renderDetail(app, silent = false) {
     }
     return;
   }
-  if (state.view !== "detail") return;
-  // Do not replace an active editor, including an IME composition.
-  if (silent && app.contains(document.activeElement) &&
-      document.activeElement.matches("input, textarea, select, [contenteditable]")) return;
+  if (state.view !== "detail" || state.detailId !== requestedId) return;
+  // 输入聚焦（含中文 IME 组字）时：不整体跳过（否则任务状态全冻结），
+  // 而是渲染后恢复焦点与草稿，保证后台更新可见且不清空正在输入的内容。
+  let focusCtx = null;
+  const ae = document.activeElement;
+  if (silent && app.contains(ae) &&
+      ae.matches("input, textarea, select, [contenteditable]")) {
+    focusCtx = { tag: ae.tagName, value: ae.value !== undefined ? ae.value : ae.textContent,
+                selStart: ae.selectionStart, id: ae.id, cls: ae.className,
+                key: ae.getAttribute("data-draft-key") || "" };
+  }
   const d = normalizeDetail(detail);
 
   // 终态停止轮询
@@ -438,6 +692,24 @@ async function renderDetail(app, silent = false) {
   else startPolling();
 
   app.innerHTML = "";
+  const _restoreFocus = () => {
+    if (!focusCtx) return;
+    // 找回应承载草稿的输入框（澄清草稿按 data-draft-key 关联）
+    const candidates = Array.from(app.querySelectorAll("input, textarea, [contenteditable]"));
+    let target = null;
+    if (focusCtx.key) target = candidates.find(n => n.getAttribute("data-draft-key") === focusCtx.key);
+    if (!target) target = candidates.find(n => n.tagName === focusCtx.tag);
+    if (target && document.activeElement !== target) {
+      try {
+        if (target.isContentEditable) target.textContent = focusCtx.value;
+        else target.value = focusCtx.value;
+        target.focus();
+        if (typeof target.setSelectionRange === "function" && focusCtx.selStart != null) {
+          target.setSelectionRange(focusCtx.selStart, focusCtx.selStart);
+        }
+      } catch (_e) { /* 恢复失败不影响主流程 */ }
+    }
+  };
 
   // 顶部
   const head = el("div", { class: "page-head" },
@@ -480,29 +752,34 @@ async function renderDetail(app, silent = false) {
   }
   app.appendChild(goalCard);
 
+  // —— 总路由 / 领域识别（来自入口闸门事件）——
+  renderRouting(app, d);
+
   // —— 待决策区 ——
   renderDecisions(app, d);
 
   // —— 子任务树 ——
-  const treeCard = el("div", { class: "card" },
-    el("h2", {}, "执行进度",
-      el("span", { class: "hint" }, "系统把目标拆成子任务，按依赖关系推进")));
+  renderResult(app, d);
+  app.appendChild(resultActions(d, { api, el, toast, refresh: () => renderDetail(app, true) }));
+  const treeCard = el("details", { class: "card", "data-process": "" },
+    el("summary", {}, "执行进度与 Subagent 状态"));
   treeCard.appendChild(buildTree(d));
   app.appendChild(treeCard);
 
   // —— 结果区 ——
-  renderResult(app, d);
 
-  // —— GEO 地图 ——
+  // —— GEO 地图（去重后一份最终结论图）——
   const geos = collectGeo(d);
   geos.forEach((g, i) => app.appendChild(buildGeoCard(g, `${d.root.id}:geo:${i}`)));
 
   // —— 事件时间线 ——
-  const evCard = el("div", { class: "card" },
-    el("h2", {}, "动作记录",
-      el("span", { class: "hint" }, `共 ${d.events.length} 条，只记录动作与事实`)));
+  const evCard = el("details", { class: "card" },
+    el("summary", {}, `动作记录（${d.events.length} 条）`));
   evCard.appendChild(buildTimeline(d.events));
   app.appendChild(evCard);
+
+  // 后台静默刷新后恢复正在输入的草稿与焦点
+  if (silent) _restoreFocus();
 }
 
 function normalizeDetail(detail) {
@@ -532,11 +809,94 @@ function normalizeDetail(detail) {
 }
 
 // ---------- 待决策 ----------
+function buildConfirmationCard(d) {
+  const conf = d.result && d.result.confirmation;
+  if (!conf) return null;
+  const RISK = { high: "danger", medium: "warn", low: "ok" };
+  const input = el("input", { type: "text", placeholder: "可直接输入补充，或选择下方方案…",
+    "data-draft-key": `${d.root.id}:confirm` });
+  input.value = state.clarificationDrafts.get(`${d.root.id}:confirm`) || "";
+  input.addEventListener("input", () =>
+    state.clarificationDrafts.set(`${d.root.id}:confirm`, input.value));
+
+  const submit = async (ev, text) => {
+    const btn = ev.currentTarget;
+    const payload = String(text || "").trim();
+    if (!payload) { toast("请选择方案或输入内容。", "warn"); return; }
+    btn.disabled = true;
+    try {
+      await api(`/api/tasks/${encodeURIComponent(d.root.id)}/message`,
+        { method: "POST", body: JSON.stringify({ text: payload }) });
+      toast("已提交，任务继续。", "success");
+      render();
+    } catch (e) { toast(errorHint(e), "error"); btn.disabled = false; }
+  };
+
+  const optButtons = (conf.options || []).map((o) =>
+    el("button", { type: "button", class: `btn sm ${RISK[o.risk] === "danger" ? "danger" : ""}`,
+      style: "text-align:left",
+      onClick: (ev) => submit(ev, o.label) },
+      el("div", {}, o.label),
+      el("div", { class: "muted", style: "font-size:12px;font-weight:normal" },
+        `影响：${o.impact || "—"}`)));
+
+  return el("div", { class: "decision-card clarify" },
+    el("div", { class: "dc-title" },
+      el("span", { class: "badge warn pulse" }, "需要你确认"),
+      el("span", {}, conf.reason_label || conf.reason_code || "请确认")),
+    el("div", { class: "note-box info", style: "margin:8px 0" },
+      el("div", { class: "lab" }, "已确认信息"),
+      el("ul", { style: "margin:4px 0 0 18px" },
+        ...(conf.confirmed_info || []).map((x) => el("li", {}, String(x))))),
+    el("div", { style: "margin:6px 0" }, el("strong", {}, "当前问题："), conf.problem),
+    el("div", { style: "margin:6px 0" }, el("strong", {}, "待决事项："), conf.decision_needed),
+    input,
+    el("div", { class: "dc-actions", style: "flex-wrap:wrap;align-items:flex-start" },
+      el("button", { class: "btn primary",
+        onClick: (ev) => submit(ev, input.value) }, "提交回答"),
+      ...optButtons));
+}
+
+function buildPauseSnapshot(d) {
+  const snap = d.result && d.result.pause_snapshot;
+  if (!snap) return null;
+  const li = (x) => el("li", {}, typeof x === "string" ? x : JSON.stringify(x));
+  return el("details", { class: "card", style: "margin-top:10px" },
+    el("summary", { style: "cursor:pointer;font-weight:600" },
+      "部分完成 / 恢复信息（已完成工作、证据、失败原因、待决问题、恢复步骤）"),
+    el("div", { style: "margin-top:8px" },
+      el("div", { class: "lab" }, `已完成工作（${(snap.completed_work || []).length}）`),
+      el("ul", {}, ...(snap.completed_work || []).map((w) =>
+        li(`${w.subagent || ""} ${w.branch ? "[" + w.branch + "]" : ""} ${w.task || ""}`))),
+      (snap.failures || []).length ? el("div", {},
+        el("div", { class: "lab", style: "color:var(--danger)" }, "失败原因"),
+        el("ul", {}, ...snap.failures.map((f) =>
+          li(`${f.branch || ""} ${f.subagent || ""}: ${f.error || JSON.stringify(f)}`)))) : null,
+      (snap.open_questions || []).length ? el("div", {},
+        el("div", { class: "lab" }, "待决问题"),
+        el("ul", {}, ...snap.open_questions.map(li))) : null,
+      el("div", { class: "lab" }, "恢复步骤"),
+      el("ul", {}, ...(snap.recovery_steps || []).map(li)),
+      (snap.evidence_refs || []).length ? el("details", {},
+        el("summary", { style: "cursor:pointer" }, `证据来源（${snap.evidence_refs.length}）`),
+        el("ul", {}, ...snap.evidence_refs.slice(0, 30).map((r) =>
+          li(`${r.entity || ""}.${r.field || ""} ${r.source_type || ""} ${r.title || r.url || ""}${r.version ? " v" + r.version : ""}`)))) : null));
+}
+
 function renderDecisions(app, d) {
   const pendingApprovals = d.approvals.filter((a) => (a.status || "pending") === "pending");
-  const clarifies = collectClarifications(d);
+  const hasConfirmation = Boolean(d.result && d.result.confirmation);
+  const clarifies = hasConfirmation ? [] : collectClarifications(d);
 
-  if (!pendingApprovals.length && !clarifies.length) {
+  const confCardEarly = buildConfirmationCard(d);
+  if (confCardEarly) {
+    const c0 = el("div", { class: "card" },
+      el("h2", {}, "需要你确认",
+        el("span", { class: "hint" }, "选择方案或直接补充；处理后任务自动继续")),
+      confCardEarly);
+    app.appendChild(c0);
+  }
+  if (!pendingApprovals.length && !clarifies.length && !confCardEarly) {
     // 仍展示已处理审批的结果（简要）
     const decided = d.approvals.filter((a) => a.status && a.status !== "pending");
     if (decided.length) {
@@ -579,9 +939,11 @@ function renderDecisions(app, d) {
     card.appendChild(box);
   }
 
+  const confCard = buildConfirmationCard(d);
+  if (confCard) card.appendChild(confCard);
   for (const c of clarifies) {
     const draftKey = `${d.root.id}:${c.name || c.question}`;
-    const input = el("input", { type: "text", placeholder: "在这里输入你的回答…" });
+    const input = el("input", { type: "text", placeholder: "在这里输入你的回答…", "data-draft-key": draftKey });
     input.value = state.clarificationDrafts.get(draftKey) || "";
     input.addEventListener("input", () => state.clarificationDrafts.set(draftKey, input.value));
     const box = el("div", { class: "decision-card clarify" },
@@ -665,9 +1027,9 @@ function collectClarifications(d) {
     }
   }
   // 3) 状态为 waiting_event 且有 clarify 信号
-  if (d.root.status === "waiting_event") {
+  if (d.root.status === "waiting_event" || d.root.status === "waiting_user" || d.root.status === "waiting_external") {
     const c = d.result && d.result.clarify;
-    if (!c) push("任务正在等待补充信息或外部事件，请在下方回答或稍后查看。");
+    if (!c) push("任务正在等待补充信息/用户确认或外部事件，请在下方回答或稍后查看。");
   }
   return out;
 }
@@ -738,6 +1100,42 @@ function miniResultOf(t) {
 }
 
 // ---------- 结果区 ----------
+// 总路由识别结果：领域、风险、缺失槽位（默认折叠细节，只显结论）
+function renderRouting(app, d) {
+  const gate = (d.events || []).find((e) => e.kind === "gate_entry");
+  const detail = gate && gate.detail ? gate.detail : null;
+  const riskBadge = (r) => r === "high" ? badge("高风险", "danger")
+    : r === "medium" ? badge("中风险", "warn") : badge("低风险", "ok");
+  const card = el("div", { class: "card" },
+    el("h2", {}, "路由识别", el("span", { class: "hint" }, "总路由 Agent 识别领域、风险与缺失条件")));
+  const row = el("div", { class: "row-gap", style: "align-items:center;flex-wrap:wrap" });
+  if (detail && detail.intent) {
+    row.appendChild(el("span", { class: "badge accent" }, "领域意图：" + detail.intent));
+  } else {
+    row.appendChild(el("span", { class: "muted" }, "领域意图待识别"));
+  }
+  if (detail && detail.emotion_signal) {
+    row.appendChild(el("span", { class: "badge" }, "含情绪信号（不单独转人工）"));
+  }
+  card.appendChild(row);
+
+  // 缺失槽位 / 待补充
+  const missing = collectClarifications(d);
+  if (missing.length) {
+    const mb = el("div", { class: "note-box warn", style: "margin-top:10px" },
+      el("span", { class: "lab" }, "待补充关键信息："),
+      missing.map((m) => el("div", { style: "margin-top:2px" }, "· " + (m.prompt || m.name))));
+    card.appendChild(mb);
+  }
+  // 路由过程默认折叠
+  const det = el("details", { style: "margin-top:8px" },
+    el("summary", { class: "muted", style: "cursor:pointer;font-size:12.5px" }, "路由信号详情"),
+    el("pre", { class: "mono muted", style: "font-size:12px;white-space:pre-wrap" },
+       detail ? JSON.stringify(detail, null, 2) : "（无）"));
+  card.appendChild(det);
+  app.appendChild(card);
+}
+
 function renderResult(app, d) {
   const r = d.result || {};
   const hasContent = r.answer || r.verified !== undefined || (Array.isArray(r.chunks) && r.chunks.length) ||
@@ -749,13 +1147,59 @@ function renderResult(app, d) {
     el("h2", {}, "结果",
       el("span", { class: "hint" }, "事实性结论都带有可核查的引用角标")));
 
-  // 核验徽标
-  if (typeof r.verified === "boolean") {
+  // 核验四档：已验证 / 部分验证 / 证据不足 / 核验失败（partial/insufficient 绝不显示通过）
+  const bucket = r.verification_bucket || r.status_bucket
+    || (r.verified === true ? "verified" : null);
+  const BUCKETS = {
+    verified: ["已验证", "ok", "全部关键事实均有证据支撑，无冲突/失败/未决审批"],
+    partial: ["部分验证", "warn", "仅部分事实被证据支撑，其余待人工确认"],
+    insufficient: ["证据不足", "warn", "没有足以确定性核验的证据，需补充来源/人工确认"],
+    failed: ["核验失败", "danger", "存在被证伪/冲突/工具失败/越权/未决审批"],
+  };
+  if (bucket && BUCKETS[bucket]) {
+    const [label, cls, hint] = BUCKETS[bucket];
+    card.appendChild(el("div", { class: "row-gap", style: "margin-bottom:8px;flex-wrap:wrap" },
+      badge(label, cls),
+      el("span", { class: "muted", style: "font-size:12.5px" }, r.verified_note || hint)));
+  } else if (typeof r.verified === "boolean") {
     card.appendChild(el("div", { class: "row-gap", style: "margin-bottom:10px" },
-      r.verified ? badge("核验通过", "ok") : badge("核验未通过", "danger"),
-      r.verified_note || r.verify_note ? el("span", { class: "muted", style: "font-size:13px" }, r.verified_note || r.verify_note) : null));
+      r.verified ? badge("已验证", "ok") : badge("待确认", "warn")));
+  }
+  // 核验计数（已验证/部分/不足/失败各多少）
+  const vc = r.verification_counts;
+  if (vc && Object.values(vc).some((n) => n)) {
+    card.appendChild(el("div", { class: "row-gap", style: "margin-bottom:8px;flex-wrap:wrap" },
+      Object.entries(vc).map(([k, n]) => badge(`${({verified:"已验证",partial:"部分",insufficient:"不足",failed:"失败",none:"无核验"})[k] || k} ${n}`,
+        k === "verified" ? "ok" : (k === "failed" ? "danger" : "")))));
+  }
+  // 核验未通过原因
+  const reasons = asArray(r.verification_reasons || r.gate_problems);
+  if (reasons.length) {
+    card.appendChild(el("div", { class: "note-box danger", style: "margin-bottom:8px" },
+      el("span", { class: "lab" }, "核验问题与原因："),
+      el("ul", { style: "margin:6px 0 0 18px" }, reasons.slice(0, 8).map((x) =>
+        el("li", { class: "muted", style: "font-size:12.5px" },
+          (x && x.kind ? `[${x.kind}] ` : "") +
+          (typeof x === "string" ? x : (x.detail ? JSON.stringify(x.detail) : JSON.stringify(x))))))));
   }
 
+  // Coordinator 研究图：证据认识分层 + 分支成败
+  const layers = r.layers;
+  if (layers) {
+    const LROW = [["confirmed", "已确认事实", "ok"], ["inferred", "模型推断", ""],
+                  ["unconfirmed", "未确认/观点", "warn"], ["unanswerable", "无法确认", "danger"]];
+    card.appendChild(el("div", { class: "row-gap", style: "margin:8px 0;flex-wrap:wrap" },
+      LROW.map(([k, lab2, c]) => badge(`${lab2} ${layers[k] || 0}`, c))));
+  }
+  if (Array.isArray(r.branches_ok) || Array.isArray(r.branches_failed)) {
+    const chips = el("div", { class: "row-gap", style: "margin:6px 0;flex-wrap:wrap" });
+    (r.branches_ok || []).forEach((b) => chips.appendChild(badge(`✓ ${b}`, "ok")));
+    (r.branches_failed || []).forEach((b) => chips.appendChild(badge(`✗ ${b}（来源失败）`, "warn")));
+    card.appendChild(chips);
+  }
+
+  const snapCard = buildPauseSnapshot(d);
+  if (snapCard) app.appendChild(snapCard);
   if (r.answer) card.appendChild(buildAnswer(r.answer, collectChunks(d), card));
   else if (hasContent) card.appendChild(el("div", { class: "muted" }, r.summary || r.note || "任务尚未产出结论。"));
 
@@ -816,8 +1260,61 @@ function renderResult(app, d) {
       list));
   }
 
+  // —— 结果反馈（已解决 / 未解决 / 答案有误）；记录用于回归改进，不自动写知识库 ——
+  if (TERMINAL_STATUS.has(d.root.status)) {
+    card.appendChild(buildFeedback(d.root.id));
+  }
+
   app.appendChild(card);
 }
+
+function buildFeedback(rootId) {
+  const wrap = el("div", { class: "feedback-box", style: "margin-top:16px;border-top:1px dashed var(--line,#ddd);padding-top:12px" });
+  wrap.appendChild(el("div", { class: "muted", style: "font-size:13px;margin-bottom:8px" },
+    "这个结果对你有帮助吗？反馈仅用于改进，未复核前不会自动写入知识库。"));
+  const row = el("div", { class: "row-gap" });
+  const catWrap = el("div", { style: "margin-top:8px;display:none" });
+  const catSel = el("select", { class: "btn sm" },
+    el("option", { value: "generation" }, "答案生成有误"),
+    el("option", { value: "retrieval" }, "没找到/找错资料"),
+    el("option", { value: "tool" }, "工具执行问题"),
+    el("option", { value: "routing" }, "理解/路由错误"),
+    el("option", { value: "ui" }, "界面/展示问题"),
+    el("option", { value: "other" }, "其他"));
+  const comment = el("input", { type: "text", class: "btn sm", style: "min-width:200px", placeholder: "补充说明（可选）" });
+  catWrap.appendChild(el("span", { class: "muted", style: "font-size:12.5px;margin-right:6px" }, "问题类型："));
+  catWrap.appendChild(catSel);
+  catWrap.appendChild(document.createTextNode(" "));
+  catWrap.appendChild(comment);
+
+  const done = (msg) => { wrap.innerHTML = ""; wrap.appendChild(el("div", { class: "muted", style: "font-size:13px" }, msg)); };
+  const send = async (verdict, showCat) => {
+    if (showCat) {
+      // 首次点"答案有误"先展开归因选择
+      if (catWrap.style.display === "none") { catWrap.style.display = "block"; return; }
+    }
+    try {
+      await api(`/api/tasks/${encodeURIComponent(rootId)}/feedback`, {
+        method: "POST",
+        body: JSON.stringify({ verdict,
+          ...(showCat ? { category: catSel.value, comment: comment.value || null } : {}) }),
+      });
+      done(verdict === "resolved" ? "已记录：问题已解决，感谢反馈。"
+        : verdict === "answer_wrong" ? "已记录答案有误，将进入回归改进。"
+        : "已记录：问题未解决，我们会据此排查。");
+    } catch (err) {
+      toast(errorHint(err), "error", "反馈提交失败");
+    }
+  };
+
+  row.appendChild(el("button", { class: "btn sm", onClick: () => send("resolved", false) }, "✅ 已解决"));
+  row.appendChild(el("button", { class: "btn sm", onClick: () => send("unresolved", false) }, "❓ 未解决"));
+  row.appendChild(el("button", { class: "btn sm", onClick: () => send("answer_wrong", true) }, "⚠️ 答案有误"));
+  wrap.appendChild(row);
+  wrap.appendChild(catWrap);
+  return wrap;
+}
+
 
 function collectChunks(d) {
   const map = new Map();
@@ -837,6 +1334,41 @@ function collectChunks(d) {
   return [...map.values()];
 }
 
+function buildExecSummary(d, r) {
+  const subs = new Map();
+  for (const t of d.subtasks || []) {
+    const role = String(t.agent_role || "subagent").replace(/^subagent[:/]/, "");
+    if (role === "coordinator" || role === "root" || role === "planner") continue;
+    const e = subs.get(role) || { role, total: 0, done: 0 };
+    e.total += 1;
+    if (t.status === "completed") e.done += 1;
+    subs.set(role, e);
+  }
+  const domain = r.domain || ((d.root && d.root.slots || {}).__domain__) || "";
+  const branchChips = [].concat(r.branches_ok || [], r.branches_failed || []);
+  const line1 = [];
+  if (domain) line1.push(badge("主 Agent（领域）：" + domain, "accent"));
+  line1.push(badge("已激活 Subagent：" + (subs.size ? [...subs.keys()].join("、") : "—"), ""));
+  const wrap = el("div", { class: "row-gap", style: "margin:10px 0;flex-wrap:wrap" });
+  line1.forEach((x) => wrap.appendChild(x));
+  const body = [];
+  if (subs.size) {
+    const chips2 = el("div", { class: "row-gap", style: "margin:4px 0 2px;flex-wrap:wrap" });
+    for (const [, e] of subs) chips2.appendChild(badge(`${e.role} ${e.done}/${e.total}`, e.done === e.total ? "ok" : ""));
+    body.push(chips2);
+  }
+  if (branchChips.length) {
+    body.push(el("div", { class: "muted", style: "font-size:12.5px;margin-top:2px" },
+      "分支：" + branchChips.join("、") + " · 各分支证据明细见下方卡片（含来源类型与时间）"));
+  }
+  if (r.evidence_count !== undefined) {
+    body.push(el("div", { class: "muted", style: "font-size:12.5px;margin-top:2px" },
+      "共 " + (r.evidence_count || 0) + " 条证据记录（来源/时间/冲突见详细列表）。"));
+  }
+  if (!body.length && !domain) return null;
+  const det = el("div", { class: "card tinted", style: "margin:8px 0" }, wrap, ...body);
+  return det;
+}
 function buildAnswer(answer, chunks, card) {
   const wrap = el("div", { class: "answer-text" });
   const idToNum = new Map();
@@ -882,18 +1414,28 @@ function buildAnswer(answer, chunks, card) {
 }
 
 // ---------- GEO ----------
+function geoSig(g) {
+  const c = g.center || {};
+  const names = (g.candidates || []).map(x => x.name || "").join("|");
+  return [g.source || "", g.radius_km, c.lat, c.lon, names].join("#");
+}
 function collectGeo(d) {
-  const out = [];
-  const consider = (r, title, key) => {
-    const g = r && r.geo;
-    if (g && Array.isArray(g.candidates) && g.candidates.length) {
-      out.push({ geo: g, title: title || "地理分析", key });
-    }
+  // 同根任务中 researcher/verifier/根结果携带同一份 candidates：按签名去重，只保留一张。
+  // 优先 verifier（独立复核后的最终结论），其次根结果。
+  const bySig = new Map();
+  const consider = (g, title, rank) => {
+    if (!g || !Array.isArray(g.candidates) || !g.candidates.length) return;
+    const sig = geoSig(g);
+    const prev = bySig.get(sig);
+    if (!prev || rank < prev.rank) bySig.set(sig, { geo: g, title, rank });
   };
-  consider(d.result, "地点分析图", "result");
-  d.subtasks.forEach((t, i) => consider(t.result,
-    `地点分析（${roleLabel(t.agent_role)}：${(t.title || t.objective || "").slice(0, 20)}）`, `st${i}`));
-  return out;
+  d.subtasks.forEach((t) => {
+    const g = t.result && t.result.geo;
+    const rank = t.agent_role === "verifier" ? 0 : 1;
+    consider(g, "地点分析图", rank);
+  });
+  consider(d.result && d.result.geo, "地点分析图", 0);
+  return Array.from(bySig.values()).map(x => ({ geo: x.geo, title: x.title }));
 }
 
 const GEO_COLORS = ["#4f6ef7", "#1a9e6b", "#d2732e", "#8459d6", "#c7458a", "#2b7fb8", "#b58a1f"];
@@ -912,14 +1454,20 @@ function buildGeoCard({ geo, title, key }, geoKey) {
     geo.crs ? el("span", { class: "mono muted" }, geo.crs) : null);
   card.appendChild(badgeRow);
 
-  // 选项卡
+  const panelKey = geoKey + ":" + (key || "x");
+  // 恢复上次选择的 tab（跨 2s 轮询不弹回"地图"）
+  const savedTab = state.geoTabs.get(panelKey) || "map";
   const tabBar = el("div", { class: "geo-tabs", role: "tablist" },
-    el("button", { type: "button", class: "geo-tab active", "data-tab": "map" }, "地图"),
-    el("button", { type: "button", class: "geo-tab", "data-tab": "list" }, `地点（${asArray(geo.candidates).length}）`));
+    el("button", { type: "button",
+                   class: "geo-tab" + (savedTab === "map" ? " active" : ""),
+                   "data-tab": "map" }, "地图"),
+    el("button", { type: "button",
+                   class: "geo-tab" + (savedTab === "list" ? " active" : ""),
+                   "data-tab": "list" }, `地点（${asArray(geo.candidates).length}）`));
   card.appendChild(tabBar);
 
-  const mapPane = el("div", { class: "geo-pane", "data-pane": "map" });
-  const listPane = el("div", { class: "geo-pane", "data-pane": "list", hidden: true });
+  const mapPane = el("div", { class: "geo-pane", "data-pane": "map", hidden: savedTab !== "map" });
+  const listPane = el("div", { class: "geo-pane", "data-pane": "list", hidden: savedTab !== "list" });
   card.appendChild(mapPane);
   card.appendChild(listPane);
 
@@ -928,9 +1476,9 @@ function buildGeoCard({ geo, title, key }, geoKey) {
     const tab = btn.dataset.tab;
     mapPane.hidden = tab !== "map";
     listPane.hidden = tab !== "list";
+    state.geoTabs.set(panelKey, tab);  // 记住选择，轮询重绘后恢复
   }));
 
-  const panelKey = geoKey + ":" + (key || "x");
   buildMapPane(mapPane, geo, panelKey);
   buildSiteList(listPane, card, geo, panelKey);
   return card;
@@ -1138,8 +1686,16 @@ function eventSummary(kind, d) {
       return `${d.tool_name || ""} 等待审批${d.reason ? "：" + d.reason : ""}`;
     case "approval_decided":
       return `${d.tool_name || ""} → ${d.decision === "approved" ? "批准" : d.decision === "rejected" ? "拒绝" : (d.decision || "")}${d.decided_by ? "（" + d.decided_by + "）" : ""}`;
-    case "task_status":
-      return `${STATUS_LABELS[d.from] || d.from || "?"} → ${STATUS_LABELS[d.to] || d.to || "?"}${d.reason ? "：" + d.reason : ""}`;
+    case "task_status": {
+      // 后端可能只发 {status}（无 from/to）；优先转换，缺失时显示目标状态。
+      const to = d.to || d.status;
+      if (d.from || d.to) {
+        return `${STATUS_LABELS[d.from] || d.from || "?"} → ${STATUS_LABELS[to] || to || "?"}${d.reason ? "：" + d.reason : ""}`;
+      }
+      return `状态：${STATUS_LABELS[to] || to || "处理中"}${d.reason ? "：" + d.reason : ""}${d.in_doubt ? "（结果待人工确认）" : ""}`;
+    }
+    case "clarify":
+      return `需要补充信息${Array.isArray(d.missing_slots) && d.missing_slots.length ? "：" + d.missing_slots.map(s => s.prompt || s.name).join("、") : ""}`;
     case "task_created":
       return d.title || d.objective || "";
     case "error":
@@ -1153,7 +1709,10 @@ function eventSummary(kind, d) {
     case "message":
       return d.text || d.message || "";
     case "llm_call":
-      return d.driver ? `驱动：${d.driver}` : "";
+      if (d.real_model_call === false) {
+        return `规则/模板动作（${d.via === "template" ? "场景模板" : "本地规则"}，非模型调用）`;
+      }
+      return d.driver ? `模型调用：${d.driver}${d.model ? "·" + d.model : ""}` : "模型调用";
     default:
       return d.message || d.reason || "";
   }
@@ -1192,6 +1751,9 @@ async function renderPlugins(app) {
 
   // 地图插件分区（工作台展示/路线/跳转用；与工具插件区分）
   app.appendChild(buildMapPluginsSection());
+  const capabilityHost = el("div", { class: "card", "data-capabilities": "" });
+  app.appendChild(capabilityHost);
+  showCapabilities(capabilityHost, { api, el });
 
   if (!list.length) {
     app.appendChild(el("div", { class: "empty" }, el("div", { class: "big" }, "没有已加载的工具插件")));
@@ -1427,7 +1989,9 @@ function init() {
     if (document.visibilityState === "visible" && state.view === "detail") renderDetail($("#app"), true);
   });
 
-  setView("tasks");
+  const route = location.hash.slice(1);
+  if (route.startsWith("task/")) setView("detail", { detailId: decodeURIComponent(route.slice(5)) });
+  else setView(["new", "knowledge", "plugins", "evolve", "eval"].includes(route) ? route : "tasks");
 }
 
 init();

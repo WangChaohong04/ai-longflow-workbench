@@ -31,19 +31,57 @@ class ToolSpec:
     params_schema: dict = dataclasses.field(default_factory=dict)
 
     def validate_args(self, args: dict) -> None:
-        """轻量参数校验：必填字段与类型（仅 str/int/float/bool/list/dict）。"""
+        """执行前参数校验：必填、类型、枚举、数值范围、嵌套结构。
+
+        支持的 meta（properties.<key>）：
+          required: bool、type: str|int|float|bool|list|dict、
+          enum: list、minimum/maximum: number、items/properties: 嵌套 schema。
+        多余参数不报错（由处理函数忽略）；校验失败抛 PluginError，动作不执行。
+        """
         schema = self.params_schema or {}
         props = schema.get("properties", {})
-        for key, val in (args or {}).items():
-            if key not in props:
-                continue  # 多余参数不报错，由处理函数自行忽略
+        args = args or {}
+
+        def _check(key, meta, value, path):
+            tname = meta.get("type")
+            if tname:
+                py = {"string": str, "str": str, "integer": int, "int": int,
+                      "number": (int, float), "float": (int, float),
+                      "boolean": bool, "bool": bool,
+                      "array": list, "list": list, "object": dict, "dict": dict}.get(tname)
+                # bool 是 int 子类：number/integer 显式拒绝 bool
+                bool_for_number = isinstance(value, bool) and tname in (
+                    "number", "integer", "int", "float")
+                if bool_for_number or (py is not None and not isinstance(value, py)):
+                    raise PluginError(
+                        f"工具 {self.name} 参数 {path} 类型错误：期望 {tname}，实际 {type(value).__name__}")
+            if "enum" in meta and value not in meta["enum"]:
+                raise PluginError(f"工具 {self.name} 参数 {path} 取值非法：{value!r} 不在 {meta['enum']}")
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                if meta.get("minimum") is not None and value < meta["minimum"]:
+                    raise PluginError(f"工具 {self.name} 参数 {path} 小于最小值 {meta['minimum']}")
+                if meta.get("maximum") is not None and value > meta["maximum"]:
+                    raise PluginError(f"工具 {self.name} 参数 {path} 大于最大值 {meta['maximum']}")
+            # 嵌套结构
+            if isinstance(value, dict) and isinstance(meta.get("properties"), dict):
+                for ck, cm in meta["properties"].items():
+                    if cm.get("required") and ck not in value:
+                        raise PluginError(f"工具 {self.name} 参数 {path}.{ck} 为必填嵌套字段")
+                    if ck in value:
+                        _check(ck, cm, value[ck], f"{path}.{ck}")
+            if isinstance(value, list) and isinstance(meta.get("items"), dict):
+                for i, item in enumerate(value):
+                    _check(key, meta["items"], item, f"{path}[{i}]")
+
         for key, meta in props.items():
-            if meta.get("required") and key not in (args or {}):
+            if meta.get("required") and key not in args:
                 raise PluginError(f"工具 {self.name} 缺少必填参数: {key}")
-        # required 数组形式（JSON Schema 风格）
         for key in schema.get("required", []):
-            if key not in (args or {}):
+            if key not in args:
                 raise PluginError(f"工具 {self.name} 缺少必填参数: {key}")
+        for key, meta in props.items():
+            if key in args:
+                _check(key, meta, args[key], key)
 
 
 @dataclasses.dataclass

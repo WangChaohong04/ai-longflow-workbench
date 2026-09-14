@@ -12,11 +12,6 @@
 
 import { getActiveMapPlugin, getActiveMapPluginId, MAP_ROUTE_MODES } from "./index.js";
 
-// 统一模式 ID -> 中文标签（UI 文案只来自这里的元数据）
-const MODE_LABEL = {
-  driving: "驾车", walking: "步行", transit: "公交", cycling: "骑行",
-};
-
 export function createMapController(deps) {
   const { el, toast, asArray, categoryOf, buildGeoSvg } = deps;
   const getConfig = deps.getConfig || (() => ({}));
@@ -29,7 +24,10 @@ export function createMapController(deps) {
     const ids = (plugin && plugin.capabilities && plugin.capabilities.routeModes) || ["driving"];
     return MAP_ROUTE_MODES.map((m) => m.id).filter((id) => ids.includes(id));
   }
-  function modeLabel(id) { return MODE_LABEL[id] || id; }
+  function modeLabel(id) {
+    const m = MAP_ROUTE_MODES.find((x) => x.id === id);
+    return (m && m.label) || id;
+  }
 
   // ---------- 站点列表（外部打开/路线入口，按 capabilities 门禁）----------
   function buildSiteList(pane, cardEl, geo, geoKey) {
@@ -42,13 +40,24 @@ export function createMapController(deps) {
       const props = c.properties || c.props || {};
       const addr = c.address || props.address || "";
       const cat = categoryOf(c);
+      // 评分/营业/安静等：有证据才展示；否则明确标"未核验"，不把样例属性当真实。
+      const rating = props.rating != null ? props.rating : null;
+      const hours = props.hours != null ? props.hours : (props.open_hours != null ? props.open_hours : null);
+      const quiet = props.quiet != null ? props.quiet : (props.good_for_work != null ? props.good_for_work : null);
       const row = el("div", { class: "site-row" },
         el("div", { class: "site-main" },
           el("div", { class: "site-name" }, c.name || "候选地点"),
           el("div", { class: "site-meta" },
             c.distance_km != null ? el("span", {}, `直线 ${(+c.distance_km).toFixed(2)} km`) : null,
             cat ? el("span", {}, ` · ${cat}`) : null,
-            addr ? el("span", { class: "muted" }, ` · ${addr}`) : null)));
+            rating != null ? el("span", { class: "muted" }, ` · 评分 ${rating}`) : null,
+            hours != null ? el("span", { class: "muted" }, ` · 营业 ${hours}`) : null,
+            quiet != null ? el("span", { class: "muted" }, ` · 适合办公 ${quiet}`) : null,
+            addr ? el("span", { class: "muted" }, ` · ${addr}`) : null),
+          (rating == null && hours == null && quiet == null)
+            ? el("div", { class: "site-meta muted", style: "font-size:11.5px;margin-top:2px" },
+                "评分/营业/环境等属性未核验（样例数据仅坐标与类别可核）")
+            : null));
       const btns = el("div", { class: "site-btns" });
       // 站内路线规划：仅在插件支持站内路线，且有中心点可作起点时显示；不调用外部打开
       if (caps.route === true && geo.center) {
